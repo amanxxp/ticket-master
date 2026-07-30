@@ -42,6 +42,43 @@ Four HTTP services + two workers. Gateway is the only public port.
 
 **Hold-state ownership rule.** Booking Service is the **only writer** of hold keys. Event Service reads them. Both go through one shared `lib/availability` module — same code computes effective status on both sides. Never two implementations.
 
+### Processes and ports
+
+| Process | Port | Owns |
+|---|---|---|
+| Gateway | 3000 (only public) | authn/authz, rate limit, routing, timeouts, correlation IDs |
+| Auth Service | 3001 | register, login, refresh, logout |
+| Event Service | 3002 | events/venues/performers CRUD, event cache, seat map, SSE |
+| Search Service | 3003 | Elasticsearch queries |
+| Booking Service | 3004 | reserve, confirm, cancel, holds, queue, waitlist, Stripe |
+| Outbox poller | — | worker, Postgres → ES |
+| Admitter | — | worker, drains queue |
+
+Workers have no inbound port. They still need their own crash-restart and graceful-shutdown paths — easy to forget until Week 5 Day 2 fails on lease release.
+
+### Routing table (built Week 4)
+
+```
+POST   /auth/*                    -> Auth      3001   public
+GET    /search                    -> Search    3003   public,  rate limited
+GET    /events                    -> Event     3002   public
+GET    /events/:id                -> Event     3002   public
+GET    /events/:id/seatmap        -> Event     3002   public
+GET    /events/:id/stream         -> Event     3002   public,  no buffering, no timeout
+POST   /events                    -> Event     3002   auth + role
+PUT    /events/:id                -> Event     3002   auth + role
+DELETE /events/:id                -> Event     3002   auth + role
+POST   /events/:id/waitlist       -> Booking   3004   auth
+POST   /queue/join                -> Booking   3004   auth,    rate limited
+GET    /queue/position            -> Booking   3004   auth
+POST   /bookings/reserve          -> Booking   3004   auth,    rate limited, admission required
+POST   /bookings/confirm          -> Booking   3004   auth,    rate limited, admission required
+POST   /bookings/:id/cancel       -> Booking   3004   auth
+POST   /webhooks/stripe           -> Booking   3004   NO auth, NO rate limit
+```
+
+Two rows that bite. The Stripe webhook carries no JWT, so it can't pass gateway auth, and rate-limiting it drops payment confirmations — its security is signature verification inside Booking Service. The SSE route needs response buffering off and the upstream timeout disabled, or it looks broken when the proxy is actually the problem.
+
 ---
 
 ## Domain Model

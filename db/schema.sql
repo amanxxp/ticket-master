@@ -16,8 +16,12 @@ CREATE TABLE venues (
   name       TEXT NOT NULL,
   location   TEXT NOT NULL,
   seat_map   JSONB NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  is_deleted BOOLEAN NOT NULL DEFAULT false
 );
+
+-- Keyset pagination scans id ASC over non-deleted rows only.
+CREATE INDEX idx_venues_active ON venues (id) WHERE is_deleted = false;
 
 CREATE TABLE performers (
   id         BIGSERIAL PRIMARY KEY,

@@ -1,9 +1,8 @@
 import { Router } from "express";
-
+import eventRoutes from "./event.routes.js"
+import venueRoutes from "./venue.routes.js"
 const router = Router();
 
-// mount your route modules here, e.g.:
-// import eventRoutes from "./event.routes.js";
-// router.use("/events", eventRoutes);
-
+router.use('/events',eventRoutes);
+router.use('/venues',venueRoutes);
 export default router;
