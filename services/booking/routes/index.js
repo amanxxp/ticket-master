@@ -1,9 +1,8 @@
 import { Router } from "express";
+import bookingRoutes from "./booking.routes.js";
 
 const router = Router();
 
-// mount your route modules here, e.g.:
-// import bookingRoutes from "./booking.routes.js";
-// router.use("/bookings", bookingRoutes);
+router.use("/bookings", bookingRoutes);
 
 export default router;
