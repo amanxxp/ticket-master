@@ -1,4 +1,4 @@
-import Router from "express";
+import { Router } from "express";
 import { validate } from "../middlewares/validate.js";
 import {
     createEventSchema,
@@ -13,8 +13,12 @@ import {
     updateEvent,
     deleteEvent,
 } from "../controllers/event.controller.js";
+import ticketRoutes from "./ticket.routes.js";
 
 const router = Router();
+
+// Mounted before '/:id' so the more specific path wins.
+router.use('/:eventId/tickets', ticketRoutes);
 
 router.route('/')
     .post(validate(createEventSchema), createEvent)
