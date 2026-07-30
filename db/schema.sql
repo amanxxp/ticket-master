@@ -41,8 +41,14 @@ CREATE TABLE events (
   is_deleted            BOOLEAN NOT NULL DEFAULT false
 );
 
--- List query filters live/upcoming events and sorts by date.
-CREATE INDEX idx_events_date_active ON events (event_date) WHERE is_deleted = false;
+-- List query filters live/upcoming events and sorts by date. `id` is in the index
+-- as the keyset tiebreak: events sharing an event_date need a stable second sort
+-- key, or pagination can skip or repeat rows across page boundaries.
+CREATE INDEX idx_events_date_active ON events (event_date, id) WHERE is_deleted = false;
+
+-- Serves the ?venueId / ?performerId list filters.
+CREATE INDEX idx_events_venue_active ON events (venue_id) WHERE is_deleted = false;
+CREATE INDEX idx_events_performer_active ON events (performer_id) WHERE is_deleted = false;
 
 CREATE TABLE tickets (
   id         BIGSERIAL PRIMARY KEY,

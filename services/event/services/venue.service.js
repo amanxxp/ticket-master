@@ -7,28 +7,13 @@ import {
     softDeleteVenue,
     countActiveEventsForVenue,
 } from "../repositories/venue.repository.js";
-
-// Postgres error codes worth surfacing to the client instead of a generic 500.
-const PG_ERROR_STATUS = {
-    '23505': 409, // unique_violation
-    '23503': 400, // foreign_key_violation
-    '23514': 400, // check_violation
-};
-
-const rethrowPgError = (error, action) => {
-    const status = PG_ERROR_STATUS[error.code];
-    if (status) {
-        throw createApiError(`Could not ${action} venue: ${error.detail ?? error.message}`, status);
-    }
-    console.error(`Error during venue ${action}`, error);
-    throw error;
-};
+import { rethrowPgError } from "../utils/helper.js";
 
 export const createVenue = async ({ name, location, seatMap }) => {
     try {
         return await insertVenue({ name, location, seatMap });
     } catch (error) {
-        rethrowPgError(error, "create");
+        rethrowPgError(error, "create", "venue");
     }
 };
 
@@ -53,7 +38,7 @@ export const editVenue = async (id, changes) => {
         return venue;
     } catch (error) {
         if (error.isApiError) throw error;
-        rethrowPgError(error, "update");
+        rethrowPgError(error, "update", "venue");
     }
 };
 
