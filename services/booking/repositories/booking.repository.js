@@ -98,6 +98,52 @@ export const getEventForBooking = async (client, eventId) => {
     return rows[0] ?? null;
 };
 
+// Reserve's Postgres half. No lock and no FOR UPDATE: a hold is not a claim on
+// the row, so there is nothing to serialize here. Its only job is to reject
+// requests that could never succeed — unknown ticket, wrong event, already sold —
+// before the Lua script runs.
+//
+// A seat could be sold between this read and the claim. That is intentionally not
+// guarded: the hold would then point at a booked seat, the seat map still renders
+// it `booked` (booked outranks held), and confirm re-checks `status = 'available'`
+// under a row lock. The hold is an optimization; Postgres stays the arbiter.
+export const getTicketsForHold = async (eventId, ticketIds) => {
+    const { rows } = await pool.query(
+        `SELECT id, status
+         FROM tickets
+         WHERE id = ANY($1::bigint[]) AND event_id = $2`,
+        [ticketIds, eventId]
+    );
+    return rows;
+};
+
+// Counts toward the per-user cap alongside live Redis holds. `pending` is
+// included because a booking mid-payment has not been given up — excluding it
+// would let a user park inventory in unpaid bookings and reserve past the cap.
+export const countUserTicketsForEvent = async (userId, eventId) => {
+    const { rows } = await pool.query(
+        `SELECT count(*)::int AS count
+         FROM booking_items bi
+         JOIN bookings b ON b.id = bi.booking_id
+         JOIN tickets t ON t.id = bi.ticket_id
+         WHERE b.user_id = $1
+           AND t.event_id = $2
+           AND b.status IN ('confirmed', 'pending')`,
+        [userId, eventId]
+    );
+    return rows[0].count;
+};
+
+export const getEvent = async (eventId) => {
+    const { rows } = await pool.query(
+        `SELECT id, max_tickets_per_user AS "maxTicketsPerUser"
+         FROM events
+         WHERE id = $1 AND NOT is_deleted`,
+        [eventId]
+    );
+    return rows[0] ?? null;
+};
+
 export const getBookingById = async (bookingId) => {
     const { rows } = await pool.query(
         `SELECT b.id, b.user_id AS "userId", b.event_id AS "eventId", b.status,

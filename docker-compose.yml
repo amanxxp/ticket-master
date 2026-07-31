@@ -1,3 +1,29 @@
+# Five independently built services plus three datastores. Each service has its
+# own image and its own container; only the gateway publishes a host port.
+#
+# Datastores only (day-to-day development, services run on the host):
+#   docker-compose up -d postgres redis elasticsearch
+# Everything, as it would be deployed:
+#   docker-compose --profile full up -d --build
+#
+# The `full` profile keeps the service containers out of the default `up`, so a
+# stale image can never quietly shadow the copy you are editing on the host.
+
+x-service-base: &service-base
+  profiles: ["full"]
+  restart: unless-stopped
+  # SIGTERM must reach node directly for the graceful-shutdown handlers to run.
+  # Compose's default 10s is not enough for a drain, so it is raised.
+  stop_grace_period: 30s
+  networks: [internal]
+
+x-postgres-env: &postgres-env
+  DB_HOST: postgres
+  DB_PORT: 5432
+  DB_USER: ticketmaster
+  DB_PASSWORD: ticketmaster
+  DB_NAME: ticketmaster
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -9,6 +35,7 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks: [internal]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ticketmaster"]
       interval: 5s
@@ -17,11 +44,17 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "allkeys-lru"]
+    # noeviction, NOT allkeys-lru. Under memory pressure LRU would silently drop
+    # hold keys — survivable, since a lost hold just reopens the seat — but it
+    # would also drop the Week 5 waiting-room queue, and evicting a queue means
+    # users lose their place with no error anywhere. Better to fail writes loudly
+    # than to lose queue position quietly.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
     ports:
       - "6379:6379"
     volumes:
       - redisdata:/data
+    networks: [internal]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -38,11 +71,100 @@ services:
       - "9200:9200"
     volumes:
       - esdata:/usr/share/elasticsearch/data
+    networks: [internal]
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
+
+  # ---------------------------------------------------------------- services
+
+  # The only container with a published port. Everything else is reachable only
+  # from inside the compose network — that is what makes "service ports are not
+  # public" a property of the deployment rather than a promise in a doc.
+  gateway:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      AUTH_URL: http://auth:3001
+      EVENT_URL: http://event:3002
+      SEARCH_URL: http://search:3003
+      BOOKING_URL: http://booking:3004
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_SECRET: dev-only-change-me
+    depends_on:
+      redis: { condition: service_healthy }
+      auth: { condition: service_started }
+      event: { condition: service_started }
+      search: { condition: service_started }
+      booking: { condition: service_started }
+
+  auth:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/auth/Dockerfile
+    environment:
+      <<: *postgres-env
+      PORT: 3001
+      JWT_SECRET: dev-only-change-me
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  event:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/event/Dockerfile
+    environment:
+      <<: *postgres-env
+      PORT: 3002
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  search:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/search/Dockerfile
+    environment:
+      PORT: 3003
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+    # service_started, not service_healthy: this service must boot with ES down
+    # and degrade, per its own startup comment. Waiting on ES health here would
+    # contradict that.
+    depends_on:
+      elasticsearch: { condition: service_started }
+
+  booking:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/booking/Dockerfile
+    environment:
+      <<: *postgres-env
+      PORT: 3004
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      HOLD_TTL_SECONDS: 600
+      STRIPE_SECRET_KEY: sk_test_changeme
+      STRIPE_WEBHOOK_SECRET: whsec_changeme
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+networks:
+  internal:
 
 volumes:
   pgdata:

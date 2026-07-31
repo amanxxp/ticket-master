@@ -1,0 +1,13 @@
+node_modules
+**/node_modules
+.git
+.env
+**/.env
+*.log
+docs
+scripts
+db/seed.js
+Dockerfile
+**/Dockerfile
+docker-compose.yml
+*.md

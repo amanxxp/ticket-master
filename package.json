@@ -4,6 +4,7 @@
   "version": "1.0.0",
   "scripts": {
     "seed": "node scripts/seed.js",
+    "reset": "bash scripts/reset.sh",
     "hammer": "node scripts/concurrency-harness.js"
   },
   "dependencies": {

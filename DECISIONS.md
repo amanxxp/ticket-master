@@ -162,16 +162,92 @@ was never sold has no history worth keeping.
 
 ---
 
+## Week 2 Day 1 — Hold mechanism
+
+### 6. Clock authority for hold expiry
+
+**Redis' clock, read inside the Lua script via `redis.call('TIME')`.** No app
+clock is ever compared to anything.
+
+Two instances with skewed clocks would otherwise disagree about the same hold, and
+whichever way the disagreement falls is a bug: the fast clock resells a live hold,
+the slow one refuses a free seat. Reading `TIME` inside the script means the
+expiry comparison and the write that follows it share a single clock reading from
+a single machine — the skew has nowhere to enter. Verified across two Booking
+Service instances configured with different TTLs, both agreeing on the same
+hold's `expiresAt`.
+
+Requires Redis ≥ 5 (effects replication), or a write after a non-deterministic
+command is rejected. Running 7-alpine.
+
+### 7. Expiry carried by a ZSET score, not a per-key TTL
+
+Three structures per event, in `shared/availability.js`: a ZSET
+(`member=ticketId, score=expiresAtMs`) for the bulk read, a HASH for ownership,
+and a per-user ZSET for the cap.
+
+The obvious design — one key per seat with `SET NX EX` — makes the *claim*
+trivial and the *read* impossible: rendering a 50,000-seat map would be 50,000
+`GET`s, and invariant 3 requires the round-trip count not to grow with seat count.
+The ZSET turns the whole event into one `ZRANGEBYSCORE`.
+
+The subtler gain is that **a score cannot expire silently.** A per-key TTL fires
+no event a reader can observe, so an SSE design built on it either polls or
+depends on keyspace notifications, which are fire-and-forget and drop on
+disconnect. Filtering by score means an expired hold is never observable as live
+in the first place — there is no window to miss. Memory is reclaimed by a lazy
+purge plus a coarse container TTL refreshed on write; neither is a correctness
+dependency, so a purge that never runs cannot resell a seat.
+
+Cost accepted: the claim now spans three keys, so it needs a Lua script rather
+than one atomic command, and all three keys must share a hash tag
+(`hold:{evt:<id>}:…`) to live on one slot.
+
+### 8. Why the per-user cap must be inside the script
+
+`max_tickets_per_user` is checked in the same Lua as the claim. Split into
+`ZCARD` then `ZADD`, two concurrent reserves both read `held = cap - 1`, both
+pass, and the user ends up over cap — the check would exist and enforce nothing.
+Verified: two concurrent 5-ticket reserves against a cap of 8 yield one 201 and
+one 422, with 5 held, never 10.
+
+The count spans both stores — confirmed tickets in Postgres, live holds in Redis —
+because a cap that ignored either could be walked past by alternating confirm and
+reserve. The Postgres half is read before the script, so a confirm landing in the
+gap makes the count stale by at most one booking. Tolerated rather than fixed:
+closing it means mirroring booked state into Redis, which gives the cap a second
+source of truth. The confirm path enforces the cap independently, and that is
+where an over-cap attempt is actually stopped.
+
+### 9. Partial overlap with your own hold is rejected, not merged
+
+Reserving `{A,B}` when you already hold `A` returns 409, not a merged hold.
+
+`A` keeps its earlier expiry while `B` would get a later one, so "the hold" would
+have two expiry times and no single honest answer for `expiresAt`. Release and
+re-reserve is unambiguous. An exact retry of a set you already hold is the
+idempotent case and returns the original `expiresAt` — retry must not extend a
+hold, or a client looping on it holds inventory forever.
+
+### 10. `holdId` is derived and unsigned
+
+`base64url(JSON.stringify({e: eventId, t: ticketIds}))`.
+
+A server-side id→hold mapping would be a second thing that can outlive the hold it
+names. Deriving the id keeps Redis the only place hold state lives. Unsigned
+because the id is a **locator, not a capability** — release re-checks ownership
+against the owner hash inside the script, so forging an id for someone else's
+seats returns 404. Signing would protect a secret the id does not carry.
+
+Decoded ids are re-validated as strictly as a request body: the value is
+attacker-controlled and reaches Lua `ARGV` and a `bigint[]` cast.
+
+---
+
 ## Still open
 
-Not yet decided — deliberately, since the code that forces the choice is not
-written:
-
-- **Why holds are in Redis and bookings are in Postgres** — partially argued in
-  (4) above; needs the explicit statement of which failure each store tolerates.
+- **Why holds are in Redis and bookings are in Postgres** — argued in (4) and (7);
+  still wants the one-line statement of which failure each store tolerates.
 - **On cancel, does the `booking_items` row get deleted or does the unique
   constraint move?** — leaning delete, per the reasoning in (5); confirm when the
-  cancel path is built (Week 2).
-- **Clock authority for hold expiry** — Week 2. Two app instances with skewed
-  clocks must not disagree about whether a hold expired. Redis' own clock via TTL
-  is the likely answer; state it once holds exist.
+  cancel path is built (Week 5).

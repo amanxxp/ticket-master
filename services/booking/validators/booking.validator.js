@@ -9,7 +9,10 @@ const isId = (value) => typeof value === "string" && ID_PATTERN.test(value) && v
 
 const MAX_TICKETS_PER_REQUEST = 20;
 
-export const validateConfirmBooking = (body) => {
+// Shared by confirm and reserve: both take exactly {eventId, ticketIds} and both
+// must reject server-derived fields. Kept as one function so the two paths cannot
+// drift into accepting different shapes for the same selection.
+const validateTicketSelection = (body) => {
     const errors = [];
 
     if (body === null || typeof body !== "object" || Array.isArray(body)) {
@@ -49,6 +52,18 @@ export const validateConfirmBooking = (body) => {
     }
 
     return { eventId, ticketIds };
+};
+
+export const validateConfirmBooking = validateTicketSelection;
+
+// `expiresAt` is added to the forbidden list by the same rule as `price`: the
+// hold's lifetime is server-set, and a client that could name it could set it to
+// next year.
+export const validateReserve = (body) => {
+    if (body !== null && typeof body === "object" && !Array.isArray(body) && "expiresAt" in body) {
+        throw createApiError("expiresAt is server-derived and must not be sent", 422);
+    }
+    return validateTicketSelection(body);
 };
 
 // Identity comes from the gateway, never the body. Week 4 replaces this header

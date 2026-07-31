@@ -159,48 +159,63 @@ ticket-master-server/
 ├── TIMELINE.md              # 6-week dated schedule
 ├── DECISIONS.md             # locked choices + one-line reasons
 ├── BLOCKERS.md              # weekly log + wrong predictions
-├── docker-compose.yml
+├── docker-compose.yml       # datastores by default; --profile full adds services
+├── .dockerignore
+├── package.json             # npm workspace root
 ├── db/
-│   ├── migrations/          # versioned up/down, never hand-edited SQL
-│   └── seed.js              # 50-ticket event + 50,000-ticket event
+│   └── schema.sql           # migrations replace this (Week 0 item, still open)
 ├── docs/                    # written as each component is built
-├── shared/                  # imported by relative path, no workspace
-│   ├── availability.js      # ONE implementation of effective seat status
-│   ├── logger.js            # JSON lines, always carries correlationId
-│   ├── shutdown.js          # SIGTERM: drain, close pools, release leases
-│   └── errors.js            # the single error shape
+├── scripts/
+│   ├── seed.js              # 50-ticket event + 50,000-ticket event
+│   ├── reset.sh             # truncate bookings, free tickets, flush redis
+│   └── concurrency-harness.js   # N parallel requests, tallies status codes
+├── shared/                  # workspace package @tm/shared
+│   ├── package.json
+│   └── availability.js      # hold key names, expiry semantics, Lua helpers
 ├── services/
 │   ├── gateway/             # 3000 — authn/authz, rate-limit, routing
 │   ├── auth/                # 3001 — register, login, refresh, logout
 │   ├── event/               # 3002 — CRUD, cache, seat map, SSE
 │   ├── search/              # 3003 — Elasticsearch queries
 │   └── booking/             # 3004 — reserve, confirm, cancel, queue, Stripe
-├── workers/
-│   ├── outbox-poller/       # Postgres → Elasticsearch
-│   └── admitter/            # drains queue, single-leader
-└── tools/
-    ├── hammer.js            # N parallel requests, tallies status codes
-    └── redis-counter.js     # wraps client, counts round trips per request
+└── workers/                 # Week 3 / Week 5
+    ├── outbox-poller/       # Postgres → Elasticsearch
+    └── admitter/            # drains queue, single-leader
 ```
 
-Each service is flat, same shape:
+Each service has the same internal shape:
 
 ```
 services/booking/
-├── package.json
-├── server.js                # listen, wire shutdown, nothing else
-├── app.js                   # express app, routes, middleware
-├── db.js                    # pool, size set explicitly
-└── redis.js                 # client, wrapped by tools/redis-counter in dev
+├── Dockerfile               # build context is the REPO ROOT, not this dir
+├── package.json             # own deps; @tm/shared where needed
+├── server.js                # connect stores, listen, graceful shutdown
+├── app.js                   # express app, /health, router, error handler
+├── config/                  # db.js, redis.js — clients and pool sizes
+├── routes/                  # thin, path → controller
+├── controllers/             # identity + validation + status codes
+├── services/                # order of operations, maps results to errors
+├── repositories/            # SQL and Lua. Never throws HTTP errors
+├── validators/              # runs before any datastore call
+├── middlewares/             # errorHandler
+└── utils/                   # apiError, response, transaction, money, holdId
 ```
 
-Three things worth knowing about this layout:
+Four things worth knowing about this layout:
 
-**`shared/availability.js` is load-bearing.** Event Service renders the seat map, Booking Service writes the holds, and both must compute "is this seat actually available" identically. Two copies of that logic drift, and drift here means showing a seat as available when it isn't. One file, imported by both.
+**Every service is independently buildable and deployable.** One image per service, own port, own container. Dockerfiles take the **repo root** as build context, because services import `@tm/shared` from outside their own folder:
 
-**`workers/` is separate from `services/` because workers have no port** — but they still need crash-restart and graceful shutdown. The admitter in particular must release its leader lease on SIGTERM, or a restart waits out the lease before anyone gets admitted.
+```bash
+docker build -f services/booking/Dockerfile -t tm-booking .
+```
 
-**`tools/` is built in Week 0, before any real code.** `hammer.js` is the only way to verify "50 concurrent requests, exactly one succeeds." `redis-counter.js` is the only way to verify the seat map costs the same at 50 tickets and 50,000 — which is the entire point of Week 2 Day 2.
+**`@tm/shared` is an npm workspace package, not a relative import.** `shared/availability.js` holds hold-key names and expiry semantics; Event Service reads those keys, Booking Service writes them, and two copies of the names would drift — drift here renders a held seat as available.
+
+The cost is a **lockstep deploy**: changing a key name in `shared/` requires deploying Event and Booking together, or the seat map shows held seats as free. Treat a change there like an `ALTER TABLE` — dual-write both names, deploy both, then drop the old. Keep `shared/` to constants and key builders; the moment business logic lands there, every service redeploys on every change.
+
+**Only the gateway publishes a port.** In compose, the other four are reachable only on the `internal` network. "Service ports are not public" is then a property of the deployment, not a promise in a doc.
+
+**Repositories never throw HTTP errors.** `hold.repository.js` returns a status string; `hold.service.js` maps it to `createApiError`. Keeps Redis and SQL out of the controller and status codes out of the data layer.
 
 ## Scope honesty
 

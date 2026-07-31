@@ -11,15 +11,17 @@
 
 ## ▶ You are here
 
-**Week 1, Day 1 — CRUD for `/events`, `/venues`, `/tickets`.**
+**Week 2, Day 2 — `GET /events/:id/seatmap` on Event Service.**
 
-DDL is already done — [db/schema.sql](db/schema.sql) has all 9 tables. Verify these four before starting, untimed, then build endpoints only:
-- `UNIQUE (ticket_id)` on `booking_items`
-- `tickets.status` limited to `available` / `booked` — no `held`
-- no `user_id` column on `tickets`
-- `events.max_tickets_per_user`
+Day 1 done: reserve + release, 30/30 acceptance checks passing, real TTL expiry verified across two instances. Key naming and expiry semantics settled in `shared/availability.js`; decisions 6–10 written up.
 
-Blocker to clear first (plumbing, not the exercise): `services/event/server.js` doesn't exist. Only auth has one.
+Clear first, untimed:
+- ☐ `scripts/redis-counter.js` — Day 2's **only** real criterion is a round-trip count; can't assert it without this
+- ☐ `docker-compose up -d postgres redis` (use `docker-compose`, the `docker compose` plugin isn't installed here)
+
+Day 2 composes ticket rows from Postgres with the live-hold ZSET read. `getLiveHolds` in `services/booking/repositories/hold.repository.js` is the shape to move into `shared/availability.js` — Event Service must read the same structures, never write them.
+
+Week 1 carry-over, if not already done: the 50-concurrent test (1× 201 / 49× 409), the guard-removal variant, and the Day 4 cold rebuild.
 
 Move this marker down as you finish each day.
 
@@ -41,9 +43,9 @@ Move this marker down as you finish each day.
 | ☐ | Graceful shutdown helper | `kill -TERM` drains, closes pools, releases leases |
 | ☐ | Explicit pool sizes per service | total budget written in `DECISIONS.md` |
 | ☐ | Redis round-trip counter (wraps client, counts per request) | prints round-trip count per HTTP request |
-| ☐ | `shared/availability.js` stub | file exists, imported by event + booking |
+| ✅ | `shared/availability.js` | key builders + expiry semantics + Lua helpers; imported by booking |
 | ☐ | Stripe test account + local webhook tunnel | test event delivered to localhost |
-| ☐ | `DECISIONS.md` — 5 write-downs from REQUIREMENTS domain section | 5 lines written |
+| ✅ | `DECISIONS.md` — write-downs from REQUIREMENTS domain section | Week 1 Day 3 defense written; 3 items still open (2 are Week 2) |
 
 Harness gates Week 1 Day 2. Counter gates Week 2 Day 2. Seed gates the 50k case. Pool sizes prevent a mystery failure in Week 5. Logger is cheap now and miserable to retrofit into 6 processes at Week 4.
 
