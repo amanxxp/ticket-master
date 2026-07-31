@@ -121,9 +121,12 @@ export const confirmBooking = async ({ userId, eventId, ticketIds }) => {
     }
 };
 
-export const getBooking = async (bookingId) => {
+// 404, not 403, on a mismatch: a 403 would confirm the id belongs to *someone*,
+// leaking booking existence to a caller who has no right to know it. Role-based
+// override (organizer/admin viewing any booking) is Week 4 authz — not wired in yet.
+export const getBooking = async (bookingId, userId) => {
     const booking = await getBookingById(bookingId);
-    if (!booking) {
+    if (!booking || booking.userId !== userId) {
         throw createApiError(`Booking ${bookingId} not found`, 404);
     }
     return booking;
