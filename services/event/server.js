@@ -1,22 +1,24 @@
 import "dotenv/config";
 import app from "./app.js";
 import pool, { connectDB } from "./config/db.js";
+import { connectRedis, disconnectRedis } from "./config/redis.js";
 
 const PORT = Number(process.env.PORT) || 3002;
 
 const startServer = async () => {
     try {
         await connectDB();
+        await connectRedis();
 
         const server = app.listen(PORT, () => {
             console.log(`Event service listening on port ${PORT}`);
         });
 
-        // Stop accepting connections, then drain the pool, before exiting.
+        // Stop accepting connections, then drain both stores, before exiting.
         const shutdown = (signal) => {
             console.log(`${signal} received, shutting down`);
             server.close(async () => {
-                await pool.end();
+                await Promise.allSettled([pool.end(), disconnectRedis()]);
                 process.exit(0);
             });
         };

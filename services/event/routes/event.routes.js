@@ -13,6 +13,7 @@ import {
     updateEvent,
     deleteEvent,
 } from "../controllers/event.controller.js";
+import { getSeatMap } from "../controllers/seatmap.controller.js";
 import ticketRoutes from "./ticket.routes.js";
 
 const router = Router();
@@ -23,6 +24,8 @@ router.use('/:eventId/tickets', ticketRoutes);
 router.route('/')
     .post(validate(createEventSchema), createEvent)
     .get(validate(listEventsQuerySchema, "query"), getEvents);
+
+router.get('/:id/seatmap', validate(eventIdParamSchema, "params"), getSeatMap);
 
 router.route('/:id')
     .get(validate(eventIdParamSchema, "params"), getEventById)

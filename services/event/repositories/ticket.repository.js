@@ -47,6 +47,19 @@ export const getTicketsByEvent = async ({ eventId, cursor = "0", pageSize = 50, 
     return { rows, nextCursor };
 };
 
+// Unpaginated by design: the seat map is defined as *every* ticket for the
+// event, so there is no page boundary to keyset over. Served by the same
+// idx_tickets_event_status index as the filtered list read.
+export const getAllTicketsForEvent = async (eventId) => {
+    const { rows } = await pool.query(
+        `SELECT ${TICKET_COLUMNS} FROM tickets t
+         WHERE t.event_id = $1
+         ORDER BY t.id ASC`,
+        [eventId]
+    );
+    return rows;
+};
+
 // event_id is in the predicate, not just the id: without it a caller could read
 // any ticket in the system through an unrelated event's URL.
 export const getTicketById = async (eventId, ticketId) => {

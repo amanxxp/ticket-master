@@ -112,6 +112,17 @@ export const lockEvent = async (client, id) => {
     return rows[0] ?? null;
 };
 
+// Lightweight existence check for read paths that don't need the venue/performer
+// join — the seat map only needs to know the event is real before it queries
+// tickets and Redis.
+export const eventExistsActive = async (id) => {
+    const { rows } = await pool.query(
+        `SELECT 1 FROM events WHERE id = $1 AND NOT is_deleted`,
+        [id]
+    );
+    return rows.length > 0;
+};
+
 export const venueExistsActive = async (client, id) => {
     const { rows } = await client.query(
         `SELECT 1 FROM venues WHERE id = $1 AND NOT is_deleted`,

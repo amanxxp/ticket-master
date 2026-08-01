@@ -1,11 +1,10 @@
 import redis from "../config/redis.js";
 import {
     holdKeys,
-    holdOwnerKey,
-    holdSeatsKey,
     HOLD_CONTAINER_TTL_SECONDS,
     LUA_PURGE_HELPERS,
     REDIS_TIME_LUA,
+    readLiveHolds,
 } from "../../../shared/availability.js";
 
 // One script, not three round trips. The cap check in particular is only real if
@@ -190,19 +189,10 @@ export const claimHold = async ({ eventId, userId, ticketIds, ttlSeconds, cap, c
 export const releaseHold = async ({ eventId, userId, ticketIds }) =>
     runScript(RELEASE_LUA, { eventId, userId, args: [userId, ...ticketIds] });
 
-// Read-only, used by the acceptance tests and by Week 2 Day 2's seat map. One
-// round trip for the whole event regardless of seat count — the ZSET exists for
-// exactly this. Scores are filtered by `now` here rather than trusting a purge
-// to have run.
+// Diagnostic read for the acceptance tests. Delegates to the shared
+// implementation so this and Event Service's /seatmap can never disagree about
+// what "held" means.
 export const getLiveHolds = async (eventId) => {
-    const [seats, owners] = await Promise.all([
-        redis.zRangeByScoreWithScores(holdSeatsKey(eventId), Date.now(), "+inf"),
-        redis.hGetAll(holdOwnerKey(eventId)),
-    ]);
-
-    return seats.map(({ value, score }) => ({
-        ticketId: value,
-        userId: owners[value] ?? null,
-        expiresAt: new Date(score).toISOString(),
-    }));
+    const byTicketId = await readLiveHolds(redis, eventId);
+    return [...byTicketId.values()];
 };

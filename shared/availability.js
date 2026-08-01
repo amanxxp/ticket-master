@@ -55,6 +55,40 @@ export const holdKeys = (eventId, userId) => [
     holdUserKey(eventId, userId),
 ];
 
+// The read path, shared verbatim by Booking's diagnostic /holds endpoint, Event
+// Service's /seatmap, and Day 3's SSE snapshot. One implementation is the whole
+// point: two copies of "what counts as held" drift, and drift here means a held
+// seat renders as available on one path and taken on another.
+//
+// Exactly two Redis round trips, regardless of how many tickets the event has —
+// ZRANGEBYSCORE returns every live hold in one call, HGETALL every owner in
+// another. A per-ticket-key design (`hold:evt:1:ticket:42`, TTL per key) cannot
+// do this: reading "all held seats for this event" would need one GET per key,
+// since Redis has no "list keys matching a pattern with their TTLs" primitive
+// that is safe to run in production (KEYS/SCAN over a live keyspace is not a
+// bulk read, it is a maintenance operation). The ZSET makes the bulk read as
+// cheap as the single-seat read.
+//
+// `<now` is the score filter, not a per-key TTL check — same expiry rule the
+// write path uses, so a hold cannot be "expired" to the writer and "live" to
+// the reader or vice versa.
+export const readLiveHolds = async (redisClient, eventId) => {
+    const [seats, owners] = await Promise.all([
+        redisClient.zRangeByScoreWithScores(holdSeatsKey(eventId), Date.now(), "+inf"),
+        redisClient.hGetAll(holdOwnerKey(eventId)),
+    ]);
+
+    const byTicketId = new Map();
+    for (const { value: ticketId, score: expiresAt } of seats) {
+        byTicketId.set(ticketId, {
+            ticketId,
+            userId: owners[ticketId] ?? null,
+            expiresAt: new Date(expiresAt).toISOString(),
+        });
+    }
+    return byTicketId;
+};
+
 // Redis' clock is the only authority on whether a hold has expired — resolves
 // the open "clock authority" item in DECISIONS.md. Two app instances with skewed
 // clocks would otherwise disagree about the same hold, and the loser of that

@@ -244,6 +244,68 @@ attacker-controlled and reaches Lua `ARGV` and a `bigint[]` cast.
 
 ---
 
+## Week 2 Day 2 — Seat map read (`GET /events/:id/seatmap`)
+
+### 11. Which structure serves the read, and why per-key TTL can't
+
+The `seats` ZSET from (7) — one `ZRANGEBYSCORE seats <now> +inf` returns every
+live hold for the event in a single call, paired with one `HGETALL owner` for
+who holds what. Two Redis round trips total, independent of ticket count; logged
+and asserted by test (`assert.equal(calls, 2)` against 500 synthetic tickets).
+
+A per-key-with-TTL design (`hold:evt:1:ticket:42`, `SET NX EX`) cannot serve this
+read at all: there is no key naming this event's *set* of holds, so listing them
+means either scanning the whole keyspace with `KEYS`/`SCAN` — unsafe on a live
+instance, and still not O(1) — or issuing one `GET` per ticket, which is exactly
+the per-seat round trip invariant 3 forbids. The ZSET is the read path; the
+per-key design was never a candidate for it.
+
+### 12. How the two structures avoid drifting
+
+They don't get the chance to: `readLiveHolds(redisClient, eventId)` in
+`shared/availability.js` is the **only** implementation that interprets the
+ZSET+HASH pair as "who holds what, right now." Booking's diagnostic
+`GET /bookings/holds/:eventId` and Event Service's `/seatmap` both call it —
+neither re-derives the logic locally. (Booking's `hold.repository.js` originally
+had its own copy; refactored to call the shared function once this endpoint
+needed the same read, so there is now exactly one.) Day 3's SSE snapshot reuses
+the same function for the same reason: a second implementation is how "expired
+in the read path but live in the write path" bugs get introduced.
+
+### 13. Booked beats held — enforced by check order, not by clearing the hold
+
+A ticket's Postgres `status` is checked **first**; the Redis hold map is only
+consulted when `status = 'available'`. This means `confirmBooking` (Week 1)
+does not need to clear the Redis hold it's converting into a sale — and does
+not. The stale entry sits in Redis until its own TTL/score lapses, but it is
+never read, because `booked` already won upstream of that check. Cost: for the
+few minutes until the score expires, `GET /bookings/holds/:eventId` (a diagnostic
+endpoint, not the seat map) would still list the now-sold ticket as "held."
+Accepted rather than fixed with an explicit release-on-confirm, since that would
+add a Redis write to the booking-confirm hot path to correct a display-only
+diagnostic.
+
+### 14. `heldByMe` needs an identity the route doesn't require
+
+The route is public (REQUIREMENTS.md: `GET /events/:id/seatmap ... public`), so
+it cannot 401 on a missing identity the way `/bookings/confirm` does. Caller
+identity is read from an optional `x-user-id` header: present → seats held by
+that id are labeled `heldByMe: true`, held-by-anyone-else `false`; absent → every
+held seat reads `heldByMe: false`, never `true` — a guest is never told a seat
+is "theirs." Same header convention Booking already uses, so Week 4's gateway
+swap (header → JWT subject) touches both services identically.
+
+### 15. Zero writes to hold keys, verified
+
+Event Service's Redis client (`services/event/config/redis.js`) only ever
+reaches `zRangeByScoreWithScores` and `hGetAll`, both via `readLiveHolds`.
+Verified two ways: `grep -rn "ZADD\|HSET\|EVAL" services/event` returns nothing,
+and the test suite wraps the fake Redis client in a `Proxy` that throws on any
+method call outside those two — a future edit that adds a write is a test
+failure, not a design doc someone forgot to check.
+
+---
+
 ## Still open
 
 - **Why holds are in Redis and bookings are in Postgres** — argued in (4) and (7);
