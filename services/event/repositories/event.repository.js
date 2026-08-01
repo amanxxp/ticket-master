@@ -1,4 +1,5 @@
 import pool from "../config/db.js";
+import { encodeEventCursor } from "../utils/eventCursor.js";
 
 // Two variants of the same projection: the prefixed one for queries that join
 // (where a bare column name would be ambiguous), the plain one for INSERT/UPDATE
@@ -24,7 +25,11 @@ export const insertEvent = async (client, { name, description, venueId, performe
     return rows[0];
 };
 
-export const getEvents = async ({ cursorDate, cursorId, pageSize = 10, venueId, performerId, upcoming = true }) => {
+// Keyset mode. `(event_date, id) > (cursorDate, cursorId)` is a single row
+// comparison Postgres can serve as one index range scan on
+// idx_events_date_active — rewriting it as `event_date > $1 OR (event_date = $1
+// AND id > $2)` produces the same rows but forces a filter instead of a scan.
+export const getEventsByCursor = async ({ cursor, limit = 10, venueId, performerId, upcoming = true }) => {
     const { rows } = await pool.query(
         `SELECT ${EVENT_COLUMNS} FROM events e
          WHERE NOT e.is_deleted
@@ -34,15 +39,32 @@ export const getEvents = async ({ cursorDate, cursorId, pageSize = 10, venueId, 
            AND ($5 = false OR e.event_date >= now())
          ORDER BY e.event_date ASC, e.id ASC
          LIMIT $6`,
-        [cursorDate ?? null, cursorId ?? null, venueId ?? null, performerId ?? null, upcoming, pageSize]
+        [cursor?.eventDate ?? null, cursor?.id ?? null, venueId ?? null, performerId ?? null, upcoming, limit]
     );
     // A short page means the scan reached the end — emitting a cursor there
     // would send the client back for a page that is always empty.
     const last = rows[rows.length - 1];
-    const nextCursor = rows.length === Number(pageSize)
-        ? { cursorDate: last.eventDate, cursorId: last.id }
-        : null;
+    const nextCursor = rows.length === limit ? encodeEventCursor(last.eventDate, last.id) : null;
     return { rows, nextCursor };
+};
+
+// Offset mode. `page`/`limit` re-run the full ordered scan from row 0 every
+// call — correct only while nothing is inserted/deleted ahead of the window.
+// See DECISIONS.md for why that makes it skip and duplicate rows under
+// concurrent writes, which the keyset mode above does not.
+export const getEventsByOffset = async ({ page = 1, limit = 10, venueId, performerId, upcoming = true }) => {
+    const offset = (page - 1) * limit;
+    const { rows } = await pool.query(
+        `SELECT ${EVENT_COLUMNS} FROM events e
+         WHERE NOT e.is_deleted
+           AND ($1::bigint IS NULL OR e.venue_id = $1)
+           AND ($2::bigint IS NULL OR e.performer_id = $2)
+           AND ($3 = false OR e.event_date >= now())
+         ORDER BY e.event_date ASC, e.id ASC
+         LIMIT $4 OFFSET $5`,
+        [venueId ?? null, performerId ?? null, upcoming, limit, offset]
+    );
+    return { rows, page, hasMore: rows.length === limit };
 };
 
 // Inner joins, deliberately without a `NOT v.is_deleted` filter: a retired venue

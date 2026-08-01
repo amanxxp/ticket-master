@@ -34,15 +34,22 @@ export const updateEventSchema = Joi.object({
     "object.min": "At least one field must be provided"
 });
 
+const MAX_LIMIT = 100;
+
 export const listEventsQuerySchema = Joi.object({
-    // Keyset cursor is composite because event_date is not unique — a date alone
-    // cannot say which of several same-day events the last page ended on.
-    cursorDate: Joi.date().iso(),
-    cursorId: id("cursorId"),
-    pageSize: Joi.number().integer().min(1).max(100).default(10),
+    // Offset mode. Mutually exclusive with `cursor` — a request can't ask for
+    // both a page number and a cursor position at once.
+    page: Joi.number().integer().min(1),
+    // Keyset mode: one opaque token encoding (event_date, id) — see
+    // utils/eventCursor.js for why the cursor has to be composite.
+    cursor: Joi.string().max(512),
+    // Capped, not rejected: `limit=100000` clamps to 100 rather than 422ing,
+    // per the resource-exhaustion requirement — a client asking for too much
+    // gets the max page size, not an error to retry with a smaller number.
+    limit: Joi.number().integer().min(1).default(10).custom((value) => Math.min(value, MAX_LIMIT)),
     venueId: id("venueId"),
     performerId: id("performerId"),
     upcoming: Joi.boolean().default(true)
-}).and("cursorDate", "cursorId").messages({
-    "object.and": "cursorDate and cursorId must be supplied together"
+}).nand("page", "cursor").messages({
+    "object.nand": "page and cursor are mutually exclusive — choose one pagination mode"
 });

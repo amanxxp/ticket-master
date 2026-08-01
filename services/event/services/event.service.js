@@ -1,10 +1,13 @@
 import { createApiError } from "../utils/apiError.js";
 import { rethrowPgError } from "../utils/helper.js";
 import { withTransaction } from "../utils/transaction.js";
+import { decodeEventCursor } from "../utils/eventCursor.js";
 import { insertOutboxEvent } from "../repositories/outbox.repository.js";
+import { getCachedEvent, setCachedEvent, invalidateCachedEvent } from "../repositories/eventCache.repository.js";
 import {
     insertEvent,
-    getEvents,
+    getEventsByCursor,
+    getEventsByOffset,
     getEventById,
     updateEvent,
     softDeleteEvent,
@@ -44,21 +47,49 @@ export const createEvent = async (input) => {
     }
 };
 
-export const getAllEvents = async (filters) => {
-    return await getEvents(filters);
+// `page` selects offset mode, `cursor` selects keyset mode; the validator's
+// .nand() already guarantees at most one is present. No `page`/`cursor` at all
+// defaults to keyset from the start (cursor = null) — the primary "browse
+// upcoming events" path, since it's the one that stays correct under concurrent
+// writes.
+export const getAllEvents = async ({ page, cursor, ...filters }) => {
+    if (page !== undefined) {
+        return await getEventsByOffset({ page, ...filters });
+    }
+    const decoded = cursor !== undefined ? decodeEventCursor(cursor) : null;
+    return await getEventsByCursor({ cursor: decoded, ...filters });
 };
 
+// Cache-aside: check Redis first, fall through to Postgres on a miss, populate
+// Redis for next time. Both paths are timed and logged so a hit's latency is
+// visible against a miss's, per the "measurably faster" acceptance criterion.
+// getEventById's projection already excludes seat_map and never touches Redis
+// hold data — this cache only ever holds the static event body, never
+// availability, so there is no separate "don't cache the live part" branch to
+// get wrong here; there is simply nothing live in what this function reads.
 export const getEvent = async (id) => {
+    const cacheStart = Date.now();
+    const cached = await getCachedEvent(id);
+    if (cached) {
+        console.log(`[event-cache] HIT id=${id} (${Date.now() - cacheStart}ms)`);
+        return cached;
+    }
+
+    const dbStart = Date.now();
     const event = await getEventById(id);
+    console.log(`[event-cache] MISS id=${id}, db fetch (${Date.now() - dbStart}ms)`);
+
     if (!event) {
         throw createApiError(`Event ${id} not found`, 404);
     }
+
+    await setCachedEvent(id, event);
     return event;
 };
 
 export const editEvent = async (id, changes) => {
     try {
-        return await withTransaction(async (client) => {
+        const updated = await withTransaction(async (client) => {
             // FOR UPDATE before the guards: without the lock, a booking committed
             // between the ticket count and the update would slip past the check.
             if (!(await lockEvent(client, id))) {
@@ -93,6 +124,15 @@ export const editEvent = async (id, changes) => {
             await emit(client, "event.updated", event);
             return event;
         });
+
+        // After commit, not inside the transaction callback above: a later
+        // throw in there still rolls the write back, and invalidating first
+        // would evict a perfectly valid cached value for a change that never
+        // happened. Stale event data after a real edit is the failure this
+        // guards against — REQUIREMENTS.md is explicit that it counts as a bug.
+        await invalidateCachedEvent(id);
+
+        return updated;
     } catch (error) {
         if (error.isApiError) throw error;
         rethrowPgError(error, "update", "event");
@@ -101,7 +141,7 @@ export const editEvent = async (id, changes) => {
 
 export const removeEvent = async (id) => {
     try {
-        return await withTransaction(async (client) => {
+        const result = await withTransaction(async (client) => {
             if (!(await lockEvent(client, id))) {
                 throw createApiError(`Event ${id} not found`, 404);
             }
@@ -130,6 +170,10 @@ export const removeEvent = async (id) => {
             await emit(client, "event.deleted", { id: deleted.id });
             return { id: deleted.id };
         });
+
+        await invalidateCachedEvent(id);
+
+        return result;
     } catch (error) {
         if (error.isApiError) throw error;
         rethrowPgError(error, "delete", "event");

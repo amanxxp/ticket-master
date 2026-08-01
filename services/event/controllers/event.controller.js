@@ -10,9 +10,9 @@ export const createEvent = async (req, res) => {
 }
 
 export const getEvents = async (req, res) => {
-    const { cursorDate, cursorId, pageSize, venueId, performerId, upcoming } = req.validatedQuery;
+    const { page, cursor, limit, venueId, performerId, upcoming } = req.validatedQuery;
     const events = await eventService.getAllEvents({
-        cursorDate, cursorId, pageSize, venueId, performerId, upcoming
+        page, cursor, limit, venueId, performerId, upcoming
     });
     return responseHandler(events, res, "All events fetched", 200);
 }

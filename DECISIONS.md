@@ -409,6 +409,117 @@ rendering the countdown.
 
 ---
 
+## Week 3 Day 1 — Pagination (`GET /events`)
+
+### 23. Why a bare-`id` keyset cursor returns the wrong order
+
+The list sorts `ORDER BY event_date ASC, id ASC`. `id` and `event_date` are
+independent — an event created later can carry an earlier `event_date` than one
+created before it (a venue backfilling next month's schedule, say). A cursor
+that filters `id > lastId` walks *insertion* order, not *display* order, and
+the two only coincide by accident.
+
+Concretely: event A (`id=5`, date Jan 10) is shown, cursor becomes `id=5`. Event
+B (`id=3`, date Jan 12) sorts *after* A by date but has a smaller id —
+`id > 5` excludes it, so it never appears; the client's "next page" silently
+skips a row that belongs there. The reverse also happens: event C (`id=9`, date
+Jan 1) sorts *before* A but has a larger id — `id > 5` includes it again on a
+later page, so a row already shown reappears.
+
+The fix is filtering on the actual sort key, tie-broken by id for the rows that
+share a date: `(event_date, id) > (lastDate, lastId)`. This is a single
+row-comparison predicate, which Postgres can serve as one range scan on
+`idx_events_date_active (event_date, id)` — not two independent filters
+OR'd together, which would force a filter step instead of a scan.
+
+### 24. Why offset pagination skips and duplicates rows under concurrent insert
+
+`LIMIT/OFFSET` has no memory of what it showed last — it re-runs the full
+ordered scan from row 0 every call and just discards the first `OFFSET` rows.
+The window is defined by *position*, not by any value in the data.
+
+If a new event is inserted with an `event_date` earlier than everything already
+paged through, every row after it shifts one position to the right. A client
+that fetched page 1 (`OFFSET 0`) and is about to fetch page 2 (`OFFSET 10`) now
+gets, at `OFFSET 10`, the row that used to be at position 9 — the last row of
+page 1, **duplicated**. Symmetrically, a delete ahead of the window shifts
+everything left, and the row that used to be first on page 2 is now at position
+9, on a page the client already fetched — it never appears, **skipped**.
+
+Keyset pagination doesn't have this failure mode because its cursor is an
+actual value from the data (`(event_date, id)` of the last row seen), not a
+position — a row inserted anywhere except immediately after that value cannot
+move where the cursor points.
+
+Offset mode is kept anyway (`?page=&limit=`) because it answers a question
+keyset can't: "jump to page 7," a UI a keyset cursor cannot support since
+skipping forward without walking every intermediate cursor is not something
+keyset was designed to do. It's the right tool for a bounded, human-paged admin
+list; the wrong one for the primary "browse upcoming events" feed, which
+defaults to keyset for exactly this reason.
+
+### 25. `limit` is clamped, not rejected
+
+`limit=100000` returns `limit: 100` in the response, not a 422. A silent cap
+protects the same resource — an unbounded `LIMIT` materializing rows without
+end — that a rejection would, but a reject forces every client integration to
+handle "my request for `limit=100000` needs a retry with a smaller number,"
+which is a worse contract for a value that has one obviously correct fallback
+(the max). Genuinely invalid values (`limit=0`, `limit=-1`, non-integers) still
+422 — only the *upper* bound is soft.
+
+---
+
+## Week 3 Day 2 — Event cache (`GET /events/:id`)
+
+### 26. Cache-aside, not write-through
+
+Read path checks Redis first, falls through to Postgres on a miss, populates
+Redis for next time (`services/event.service.js#getEvent`). Write path
+(`editEvent`/`removeEvent`) invalidates the key rather than writing the new
+value into the cache directly.
+
+Write-through would mean every `PUT`/`DELETE` computes and writes the
+post-update cache entry as part of the request — extra work on a path that
+already has more to do (guards, the outbox insert, the transaction commit),
+for a value nobody may read again before its TTL would have expired anyway.
+Invalidate-and-let-the-next-reader-repopulate is cheaper and just as correct:
+the next `GET` after an edit is a guaranteed miss, which is exactly the
+guarantee needed — a stale hit is the failure being prevented, and an
+invalidated key cannot serve one.
+
+### 27. The seat map must never be served from this cache — it never even reaches it
+
+Not a defensive check the code has to enforce (there is no
+`if (path === '/seatmap') skipCache()` anywhere) — it's true by construction.
+`getEventById`'s projection (`services/event/repositories/event.repository.js`)
+was scoped, back in Week 1, to `id, name, description, venueId, performerId,
+eventDate, maxTicketsPerUser, createdAt` plus the joined venue/performer —
+deliberately excluding `seat_map` and never touching Redis hold state at all.
+The cache in front of it (`eventCache.repository.js`) can only ever hold what
+that query returns, which is the static event body — nothing live is in the
+value being cached, so there is no live value the cache could accidentally
+serve.
+
+`GET /events/:id/seatmap` is a completely separate code path
+(`seatmap.service.js`) that reads current ticket status from Postgres and
+current holds from Redis on **every call**, with no cache in front of it at
+all. The boundary is: *the event's own facts* (name, date, venue) are
+cacheable because only an explicit edit changes them, and an edit already
+invalidates the key; *availability* (booked/held/available per ticket) changes
+on every reserve/release/confirm — a rate no TTL could track — so it is
+recomputed fresh, always.
+
+Crossing this boundary — caching a seat map, or adding `seat_map`/ticket
+status into the cached event body — would not be a staleness nit tunable by a
+shorter TTL. A booked seat rendering as available for even one TTL window is
+the double-book invariant's failure mode reached through the read side instead
+of the write side: nothing downstream re-checks a `GET` response before a
+client acts on it, so a stale "available" is indistinguishable from a real one
+until the booking attempt itself fails.
+
+---
+
 ## Still open
 
 - **Why holds are in Redis and bookings are in Postgres** — argued in (4) and (7);
