@@ -1,6 +1,7 @@
 import { createApiError } from "../utils/apiError.js";
 import { withTransaction } from "../utils/transaction.js";
 import { sumPrices } from "../utils/money.js";
+import { publishAvailabilityChange } from "../utils/publishAvailability.js";
 import {
     lockTicketsForBooking,
     bookTickets,
@@ -26,7 +27,7 @@ const DEADLOCK_DETECTED = "40P01";
 
 export const confirmBooking = async ({ userId, eventId, ticketIds }) => {
     try {
-        return await withTransaction(async (client) => {
+        const result = await withTransaction(async (client) => {
             const event = await getEventForBooking(client, eventId);
             if (!event) {
                 throw createApiError(`Event ${eventId} not found`, 404);
@@ -103,6 +104,13 @@ export const confirmBooking = async ({ userId, eventId, ticketIds }) => {
 
             return { ...booking, ticketIds };
         });
+
+        // After commit, not inside the transaction callback above: a later step
+        // in that callback could still throw and roll everything back, and
+        // publishing before commit would announce a booking that never happened.
+        await publishAvailabilityChange(eventId, "confirm", ticketIds);
+
+        return result;
     } catch (error) {
         if (error.isApiError) throw error;
 

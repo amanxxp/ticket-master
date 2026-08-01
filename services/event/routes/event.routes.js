@@ -14,6 +14,7 @@ import {
     deleteEvent,
 } from "../controllers/event.controller.js";
 import { getSeatMap } from "../controllers/seatmap.controller.js";
+import { streamEvent } from "../controllers/stream.controller.js";
 import ticketRoutes from "./ticket.routes.js";
 
 const router = Router();
@@ -26,6 +27,7 @@ router.route('/')
     .get(validate(listEventsQuerySchema, "query"), getEvents);
 
 router.get('/:id/seatmap', validate(eventIdParamSchema, "params"), getSeatMap);
+router.get('/:id/stream', validate(eventIdParamSchema, "params"), streamEvent);
 
 router.route('/:id')
     .get(validate(eventIdParamSchema, "params"), getEventById)

@@ -60,6 +60,18 @@ export const getAllTicketsForEvent = async (eventId) => {
     return rows;
 };
 
+// Bounded lookup for the stream's delta push — one pub/sub message names the
+// handful of tickets that changed, not the whole event. `id = ANY` over a small
+// array rather than N single-ticket queries.
+export const getTicketsByIds = async (eventId, ticketIds) => {
+    const { rows } = await pool.query(
+        `SELECT ${TICKET_COLUMNS} FROM tickets t
+         WHERE t.event_id = $1 AND t.id = ANY($2::bigint[])`,
+        [eventId, ticketIds]
+    );
+    return rows;
+};
+
 // event_id is in the predicate, not just the id: without it a caller could read
 // any ticket in the system through an unrelated event's URL.
 export const getTicketById = async (eventId, ticketId) => {

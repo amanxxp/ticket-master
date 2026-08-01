@@ -89,6 +89,26 @@ export const readLiveHolds = async (redisClient, eventId) => {
     return byTicketId;
 };
 
+// Pub/sub channel naming for Day 3's SSE fan-out. Booking Service (the only
+// publisher) and Event Service (the only subscriber) must agree on this name
+// without either hardcoding the other's string — same drift risk as the hold
+// keys above, same fix: one shared definition.
+//
+// One channel per event rather than one global channel filtered by payload,
+// so Event Service can pSUBSCRIBE a single pattern and let Redis do the
+// filtering — no per-message eventId comparison against every open connection.
+const CHANNEL_PREFIX = "availability:event:";
+
+export const availabilityChannel = (eventId) => `${CHANNEL_PREFIX}${eventId}`;
+
+export const AVAILABILITY_CHANNEL_PATTERN = `${CHANNEL_PREFIX}*`;
+
+export const parseAvailabilityChannel = (channel) => {
+    if (!channel.startsWith(CHANNEL_PREFIX)) return null;
+    const eventId = channel.slice(CHANNEL_PREFIX.length);
+    return /^\d+$/.test(eventId) ? eventId : null;
+};
+
 // Redis' clock is the only authority on whether a hold has expired — resolves
 // the open "clock authority" item in DECISIONS.md. Two app instances with skewed
 // clocks would otherwise disagree about the same hold, and the loser of that

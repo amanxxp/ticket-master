@@ -306,6 +306,109 @@ failure, not a design doc someone forgot to check.
 
 ---
 
+## Week 2 Day 3 — SSE fan-out (`GET /events/:id/stream`)
+
+### 16. Redis pub/sub, not an in-process `EventEmitter`
+
+Two Event Service instances behind a load balancer must both deliver a reserve
+that landed on neither of them — Booking Service publishes once, to Redis, and
+every instance's own subscriber receives its own copy. An `EventEmitter` only
+fans out within the process that emitted it; a reserve published on instance A
+would never reach a client connected to instance B, and there is no way to
+notice the gap from inside either instance. Verified: two SSE clients on
+different hard-coded ports (simulating two instances against one Redis) both
+receive one `reserve` from a third client's request.
+
+### 17. One channel per event, not one global channel filtered per-message
+
+`availability:event:<id>`, defined once in `shared/availability.js` and used
+by both the publisher (Booking) and the subscriber (Event Service) —
+`availabilityChannel`/`parseAvailabilityChannel`/`AVAILABILITY_CHANNEL_PATTERN`,
+so neither side hardcodes the other's string.
+
+A single global channel would mean every Event Service instance receives every
+event's traffic and must inspect and discard the payloads it doesn't care
+about — cost that scales with total platform activity, not with what that
+instance's connected clients are watching. `PSUBSCRIBE availability:event:*`
+lets Redis do the filtering at the pattern-match level; the handler still
+receives every event's messages (Redis pub/sub has no per-instance interest
+filtering below the channel/pattern given), but at least the *decision* of
+which channels exist is centralized in the shared module, so channel naming
+cannot drift between publisher and subscriber. The actual "does anyone here
+care" check is `registry.hasClients(eventId)`, in-process, before any
+Postgres/Redis read — that's what keeps per-message cost near zero for an
+event with no local subscribers.
+
+### 18. Delta payload carries ticketIds, not pre-rendered status
+
+Booking publishes `{ type, ticketIds }` — the *fact* that something changed —
+not `{ type, ticketIds, status: 'held', heldByMe: true }` or similar. It
+cannot render `heldByMe`, because that depends on which viewer is asking, and
+Booking has no idea which of N open SSE connections on Event Service will
+receive this message or who is behind each one.
+
+Event Service resolves the rendering per connected client: `getTicketDeltas`
+reads Postgres + Redis for the named ticketIds once per incoming message
+(not once per event, but not once per client either), then
+`toSeatStatus(ticket, holds, viewerUserId)` — the exact function `/seatmap`
+already uses — runs once per locally-connected client on that event. Same
+function, so a push and a fresh snapshot can never disagree about what
+`held`/`booked`/`available` means for the same underlying state.
+
+### 19. Reconnect gets a full snapshot via `getSeatMap`, not partial replay
+
+On connect (first time or after a drop), the stream immediately writes an
+`event: snapshot` frame built by calling `seatmapService.getSeatMap` — the
+identical function backing `GET /events/:id/seatmap`. No attempt is made to
+replay messages missed while disconnected; pub/sub in Redis is fire-and-forget,
+so there is nothing to replay from even if the code wanted to. A client that
+was gone for 30 seconds does not need the 12 deltas it missed — it needs
+correct *current* state, which one snapshot read already gives it in the same
+2 Redis round trips + 1 Postgres read the seat map costs standing alone.
+
+### 20. Publisher failure never fails the request it's about
+
+`publishAvailabilityChange` swallows and logs; it is never awaited in a way
+that can throw back into `confirmBooking`/`reserve`/`release`. A booking has
+already committed to Postgres by the time it runs — failing to announce the
+change over pub/sub cannot un-book the seat, so surfacing that failure to the
+client as a booking error would misreport the actual outcome. Cost accepted:
+open SSE streams learn about the change late (only at a client's next
+reconnect snapshot) if Redis pub/sub itself is unreachable at the moment of
+publish, rather than not at all — Postgres and the hold data Redis still holds
+remain the source of truth throughout.
+
+### 21. `EXISTING` (idempotent retry) does not publish; `CLAIMED` does
+
+Reserve's idempotent-retry branch (double-click returns the same hold,
+unchanged `expiresAt`) intentionally skips the publish — nothing in the store
+moved, so telling every open stream "something changed" would be a false
+signal solely because a client re-sent a request. Only a state transition —
+`CLAIMED`, `RELEASED`, `confirm` succeeding — triggers a publish. Rejected
+claims (`CONFLICT`/`OVERLAP`/`CAP_EXCEEDED`) and a rolled-back confirm publish
+nothing for the same reason: no committed change happened.
+
+### 22. Hold expiry is client-derived from `expiresAt`, not a server tick
+
+No process emits a "this hold just expired" event at the moment a TTL lapses.
+The client already has `expiresAt` from the snapshot or a prior delta and
+computes "is this still held" locally against its own clock. A server tick
+(a `setInterval` sweep publishing expiries) was rejected: it would need to
+scan every event's holds on a schedule to find newly-expired ones, reintroducing
+the sweeper-as-correctness-dependency problem (7) already rejected for the
+write side, just relocated to the read side. Redis keyspace notifications were
+also rejected, for the reason stated in `shared/availability.js`: they are
+fire-and-forget per subscriber and drop silently across a disconnect, which is
+exactly the gap an SSE reconnect-snapshot design cannot tolerate.
+
+Cost accepted: a client with a badly skewed local clock can show a hold as live
+a few seconds past or before the server's own view of `expiresAt`. Never a
+correctness bug — Postgres and the Redis score are still the only things any
+write path checks — only ever a momentary display discrepancy on the client
+rendering the countdown.
+
+---
+
 ## Still open
 
 - **Why holds are in Redis and bookings are in Postgres** — argued in (4) and (7);

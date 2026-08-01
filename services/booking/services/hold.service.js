@@ -1,6 +1,7 @@
 import { createApiError } from "../utils/apiError.js";
 import { encodeHoldId } from "../utils/holdId.js";
 import { HOLD_TTL_SECONDS } from "../../../shared/availability.js";
+import { publishAvailabilityChange } from "../utils/publishAvailability.js";
 import { claimHold, releaseHold } from "../repositories/hold.repository.js";
 import {
     countUserTicketsForEvent,
@@ -53,6 +54,12 @@ export const reserve = async ({ userId, eventId, ticketIds }) => {
     switch (result.status) {
         case "CLAIMED":
         case "EXISTING":
+            // Only a real claim is a change worth telling open streams about —
+            // EXISTING means the store did not move, so publishing it would push
+            // a no-op update to every client watching the event.
+            if (result.status === "CLAIMED") {
+                await publishAvailabilityChange(eventId, "reserve", ticketIds);
+            }
             return {
                 holdId: encodeHoldId(eventId, ticketIds),
                 eventId,
@@ -93,6 +100,11 @@ export const release = async ({ userId, eventId, ticketIds }) => {
 
     switch (result.status) {
         case "RELEASED":
+            // ticketIds requested, not the exact "ours" subset the Lua script
+            // freed — a superset is harmless here: the delta path recomputes
+            // real status per ticket, so naming one that was already free just
+            // costs an extra no-op entry in the pushed payload.
+            await publishAvailabilityChange(eventId, "release", ticketIds);
             return { eventId, ticketIds, released: result.released };
 
         // 404 rather than 403 on someone else's hold: a 403 would confirm the
