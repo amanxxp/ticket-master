@@ -7,7 +7,7 @@ export const confirmBooking = async (req, res) => {
     const userId = requireUserId(req);
     const { eventId, ticketIds } = validateConfirmBooking(req.body);
 
-    const booking = await bookingService.confirmBooking({ userId, eventId, ticketIds });
+    const booking = await bookingService.confirmBooking({ userId, eventId, ticketIds, correlationId: req.correlationId });
     return responseHandler(booking, res, "Booking confirmed", 201);
 }
 

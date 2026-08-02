@@ -9,7 +9,7 @@ export const reserveTickets = async (req, res) => {
     const userId = requireUserId(req);
     const { eventId, ticketIds } = validateReserve(req.body);
 
-    const hold = await holdService.reserve({ userId, eventId, ticketIds });
+    const hold = await holdService.reserve({ userId, eventId, ticketIds, correlationId: req.correlationId });
 
     // 200 on an unchanged retry, 201 on a hold that was created — a double-click
     // should not read as two creations.
@@ -25,7 +25,7 @@ export const releaseTickets = async (req, res) => {
     const userId = requireUserId(req);
     const { eventId, ticketIds } = decodeHoldId(req.params.id);
 
-    const released = await holdService.release({ userId, eventId, ticketIds });
+    const released = await holdService.release({ userId, eventId, ticketIds, correlationId: req.correlationId });
     return responseHandler(released, res, "Hold released", 200);
 };
 

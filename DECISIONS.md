@@ -664,6 +664,86 @@ for a deleted event through this index; whoever needs that Postgres's own
 
 ---
 
+## Week 4 Day 1 — Gateway routing/proxy + correlation IDs
+
+### 37. Error shape finally converges on `{error:{code,message,correlationId}}`
+
+REQUIREMENTS.md's cross-cutting section has specified this shape since Week 1;
+every service instead shipped `{statusCode,success,message,data}`, flagged as a
+known gap in three earlier sessions rather than fixed, since fixing it wasn't
+in scope for whatever endpoint was being built at the time. Correlation ID
+forces the issue: it has to be "in every error body," which means touching
+every service's `errorHandler.js` regardless — completing the shape fix in the
+same edit costs nothing additional and finally closes a gap that kept getting
+deferred. `shared/httpError.js` centralizes the status→code mapping so the
+`code` string can't drift between services the way the enclosing shape did.
+Success responses (`{statusCode,success,message,data}`) are untouched — the
+spec's shape requirement names only the error envelope, so only that changed.
+
+### 38. Proxy errors get their own `on.error` handler, not the library's default
+
+`http-proxy-middleware` v4 ships a default `errorResponsePlugin` that writes a
+plain-text body directly and is silently skipped whenever `options.on.error`
+is supplied (confirmed in its own `get-plugins.js`) — so providing a custom
+handler doesn't risk a double-write race against the default one; it fully
+replaces it. This is what lets a downstream failure return the same
+`{error:{...}}` shape and `correlationId` as every other error in the system,
+rather than a plain-text string a client would have to special-case.
+
+### 39. Downstream failures return 503, not the library's default 504
+
+`http-proxy-middleware`'s own `getStatusCode` maps `ECONNREFUSED`/`ETIMEDOUT`/
+etc. to 504 (Gateway Timeout). The written requirement is explicit — "Downstream
+service down → 503" — so the custom `on.error` handler always answers 503
+regardless of the underlying error code, matching the status codes
+REQUIREMENTS.md's cross-cutting section actually names (which lists 503
+nowhere as 504's synonym; only 503 appears). A 504 is defensible in general,
+but it isn't what was asked for here.
+
+### 40. `proxyTimeout` is an idle timeout, which is exactly why disabling it (not raising it) is correct for SSE
+
+`proxyTimeout` measures no-activity time on the connection to the target, not a
+hard cap on total connection duration — confirmed by reading `httpxy`'s
+implementation (`proxyReq.setTimeout(ms, cb)`, Node's own idle-timeout
+semantics). The stream route's own heartbeat (every 15s, from
+`stream.controller.js`) would keep resetting a *large* timeout indefinitely
+anyway, so a large-but-finite value would already work in practice. It's set
+to `0` (disabled outright) instead, because a stream is long-lived by design —
+its end condition is "the client disconnected," never "too much time passed" —
+and expressing that as "a very large number, chosen to outlast the heartbeat"
+is a magic constant standing in for "there is no timeout here," when the code
+can just say that directly.
+
+### 41. Correlation ID crosses the pub/sub hop by riding in the message body
+
+Redis pub/sub has no header concept — a `PUBLISH`/`SUBSCRIBE` message is just a
+string. The only way the id can survive the HTTP→Redis→SSE hop
+("gateway → booking → pub/sub → SSE") is to be part of the JSON payload
+`publishAvailabilityChange` already sends, so it's added there
+(`{type, ticketIds, correlationId}`) rather than invented as a separate
+mechanism. `sse/subscriber.js` reads it back out of the same payload it already
+parses and logs it — the only two touchpoints needed to make the whole chain
+traceable by one id, since everything in between (Redis itself) just carries
+opaque bytes.
+
+### 42. "Every log line of every service" is honored for the request lifecycle and the named trace path — not retrofitted onto every pre-existing log statement
+
+A genuine scope boundary, stated plainly rather than glossed over: dozens of
+`console.log`/`console.error` calls already existed across event/booking/search/
+the outbox poller before this session (ticket minting, hold claims, transaction
+retries, ...), many in background workers with no `req` in scope at all. Every
+one of those was NOT retrofitted to carry a correlation id — that would be a
+purely mechanical sweep with no design decision left in it, and it wasn't
+undertaken here. What *is* built and tested: a `requestLogger` middleware
+giving every HTTP request in every service exactly one access-log line carrying
+its id; `errorHandler`'s own log line does the same for unexpected errors; and
+the specific path the acceptance criterion names — gateway → booking → pub/sub
+→ Event Service's subscriber — is fully wired and provable by grepping one id
+across three services' stdout. The claim is bounded to what was actually built,
+not stretched to cover log lines nobody touched.
+
+---
+
 ## Still open
 
 - **Why holds are in Redis and bookings are in Postgres** — argued in (4) and (7);

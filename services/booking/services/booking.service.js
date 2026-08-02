@@ -25,7 +25,7 @@ const guardDisabled = () => process.env.BOOKING_DISABLE_ROWCOUNT_GUARD === "true
 const UNIQUE_VIOLATION = "23505";
 const DEADLOCK_DETECTED = "40P01";
 
-export const confirmBooking = async ({ userId, eventId, ticketIds }) => {
+export const confirmBooking = async ({ userId, eventId, ticketIds, correlationId }) => {
     try {
         const result = await withTransaction(async (client) => {
             const event = await getEventForBooking(client, eventId);
@@ -108,7 +108,7 @@ export const confirmBooking = async ({ userId, eventId, ticketIds }) => {
         // After commit, not inside the transaction callback above: a later step
         // in that callback could still throw and roll everything back, and
         // publishing before commit would announce a booking that never happened.
-        await publishAvailabilityChange(eventId, "confirm", ticketIds);
+        await publishAvailabilityChange(eventId, "confirm", ticketIds, correlationId);
 
         return result;
     } catch (error) {

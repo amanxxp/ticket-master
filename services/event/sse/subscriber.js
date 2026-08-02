@@ -27,6 +27,12 @@ const handleMessage = async (message, channel) => {
     const ticketIds = Array.isArray(payload.ticketIds) ? payload.ticketIds : [];
     if (ticketIds.length === 0) return;
 
+    // The last hop of "gateway → booking → pub/sub → SSE": this is the only
+    // place that id can be read back out of the Redis message and logged on the
+    // Event Service side, since pub/sub carries no header of its own — the
+    // publisher put it in the payload body specifically so this line is possible.
+    console.log(`[${payload.correlationId}] pushing availability update for event ${eventId} (${payload.type})`);
+
     try {
         const { tickets, holds } = await getTicketDeltas(eventId, ticketIds);
         registry.broadcast(eventId, (viewerUserId) => ({
@@ -37,7 +43,7 @@ const handleMessage = async (message, channel) => {
         // A dropped update self-heals: reconnect calls getSeatMap for a fresh
         // full snapshot, so failing to push one delta cannot leave a client
         // permanently wrong, only briefly stale.
-        console.error(`Failed to process availability update for event ${eventId}:`, err.message);
+        console.error(`[${payload.correlationId}] Failed to process availability update for event ${eventId}:`, err.message);
     }
 };
 

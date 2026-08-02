@@ -9,7 +9,7 @@ import {
     getTicketsForHold,
 } from "../repositories/booking.repository.js";
 
-export const reserve = async ({ userId, eventId, ticketIds }) => {
+export const reserve = async ({ userId, eventId, ticketIds, correlationId }) => {
     const event = await getEvent(eventId);
     if (!event) {
         throw createApiError(`Event ${eventId} not found`, 404);
@@ -58,7 +58,7 @@ export const reserve = async ({ userId, eventId, ticketIds }) => {
             // EXISTING means the store did not move, so publishing it would push
             // a no-op update to every client watching the event.
             if (result.status === "CLAIMED") {
-                await publishAvailabilityChange(eventId, "reserve", ticketIds);
+                await publishAvailabilityChange(eventId, "reserve", ticketIds, correlationId);
             }
             return {
                 holdId: encodeHoldId(eventId, ticketIds),
@@ -95,7 +95,7 @@ export const reserve = async ({ userId, eventId, ticketIds }) => {
     }
 };
 
-export const release = async ({ userId, eventId, ticketIds }) => {
+export const release = async ({ userId, eventId, ticketIds, correlationId }) => {
     const result = await releaseHold({ eventId, userId, ticketIds });
 
     switch (result.status) {
@@ -104,7 +104,7 @@ export const release = async ({ userId, eventId, ticketIds }) => {
             // freed — a superset is harmless here: the delta path recomputes
             // real status per ticket, so naming one that was already free just
             // costs an extra no-op entry in the pushed payload.
-            await publishAvailabilityChange(eventId, "release", ticketIds);
+            await publishAvailabilityChange(eventId, "release", ticketIds, correlationId);
             return { eventId, ticketIds, released: result.released };
 
         // 404 rather than 403 on someone else's hold: a 403 would confirm the
