@@ -520,6 +520,150 @@ until the booking attempt itself fails.
 
 ---
 
+## Week 3 Day 3 — Search Service + Elasticsearch
+
+### 28. Why not `LIKE '%term%'` on Postgres — what an inverted index actually does
+
+`LIKE '%term%'` has a leading wildcard, which means Postgres cannot use a
+B-tree index to jump to matching rows — a B-tree is ordered by prefix, and
+"contains this substring anywhere" isn't a prefix condition, so the only plan
+available is a sequential scan comparing the pattern against every row's text.
+Cost scales with table size, not with how selective the search is. It also has
+no fuzziness (a search for "Cocnert" simply does not match "Concert" — an exact
+substring engine has no notion of edit distance) and no relevance ranking (a
+row either contains the substring or it doesn't; there is no way to say one
+match is a better match than another).
+
+An inverted index flips the relationship: instead of "for each row, does it
+contain the term," it stores "for each term, which rows contain it" — a
+term → postings-list map built once at index time. A query becomes a lookup
+into that map, not a scan of every document. Elasticsearch's edge-ngram
+analyzer (`shared/searchIndex.js`) extends this by indexing every prefix of a
+token as its own term, so "conc" is a real dictionary entry pointing directly
+at "Concert" documents — no scan, no substring search, just another lookup.
+Fuzzy matching (`fuzziness: AUTO` at query time) adds edit-distance tolerance on
+top of the same term-lookup structure, which a `LIKE` scan has no equivalent
+of at any cost.
+
+### 29. Two matching mechanisms for two different acceptance criteria
+
+"`conc` finds `Concert`" and "a one-character typo still matches" are not the
+same problem and one mechanism does not solve both. Prefix matching
+("`conc`" → "Concert") needs the query term to already exist as an indexed
+unit — solved by the edge-ngram `.autocomplete` subfield, queried *without*
+fuzziness (the prefix is already a literal indexed term; adding fuzzy matching
+on top of an ngram field would explode the candidate set for no benefit,
+since near-misses of a 4-character ngram fragment are mostly noise). Typo
+tolerance needs edit-distance comparison against the *whole* term — solved by
+`fuzziness: AUTO` on the plain analyzed field, which the ngram field cannot
+give for free (ngram-ing "Cocnert" produces a completely different set of
+fragments than ngram-ing "Concert").
+
+`search.service.js` runs both as `should` clauses under one `bool` query
+(`minimum_should_match: 1`) rather than picking one — a real user query can
+need either, and there's no way to tell in advance which one a given term is.
+
+### 30. Multi-filter is one `bool.must`, each filter independently optional
+
+`term`, `location`, `date` each contribute a clause only when present
+(`termClause`/`locationClause`/`dateClause` all return `null` on an absent
+param, filtered out before the query is built) — an absent `bool.must` entirely
+falls back to `match_all`. This is what makes "term + location + date range
+together" and "`term=''` still returns results" both true from the same code
+path: there is no special-cased "if only term" vs "if term and location"
+branching to keep in sync: `must.length` is just however many of the three
+filters happened to be present.
+
+### 31. `type` is accepted but not applied — no domain field backs it
+
+The events table (`db/schema.sql`) has no category/type column anywhere in the
+domain model, and REQUIREMENTS.md's Domain Model section never introduces one.
+Rather than filtering against a fabricated field (which would either silently
+match nothing whenever `type` is passed, or worse, guess at mapping it onto
+some other column and produce a wrong-but-plausible-looking result), the
+validator accepts `type` without erroring — a client sending it does not 422 —
+but `search.service.js` never reads it. This is a real gap, not a completed
+feature: adding a genuine `type`/category concept to `events` is a schema
+decision for whoever owns that domain model change, not something to invent
+silently inside the search layer.
+
+---
+
+## Week 3 Day 4 — Transactional outbox + poller → Elasticsearch
+
+### 32. Three sentences on Debezium + Kafka vs. this poller
+
+Debezium reads Postgres's write-ahead log directly (log-based CDC), so it
+captures every change with sub-second latency and zero extra write inside the
+application's own transaction, and it needs no outbox table at all since it
+decodes INSERT/UPDATE/DELETE straight from the replication stream. This
+poller instead requires an explicit outbox row written inside every business
+transaction (one extra insert per write) and finds changes by periodically
+scanning that table, trading near-real-time delivery for a polling delay
+(`OUTBOX_POLL_INTERVAL_MS`) and a discipline every future writer must follow
+correctly by hand. What Debezium costs in return: a Kafka Connect cluster (or
+standalone Debezium server) to operate, a replication slot on Postgres whose
+WAL can bloat if a consumer falls behind, and materially more infrastructure
+than one Node process running a SQL query in a loop.
+
+### 33. `FOR UPDATE SKIP LOCKED` is the competing-consumers guard
+
+Two poller instances running the identical claim query at the same moment
+each lock a disjoint set of outbox rows: whatever instance A already holds
+`FOR UPDATE`, instance B's `SKIP LOCKED` excludes from its own result set
+outright, rather than blocking behind A's lock waiting for it to release.
+Neither instance ever waits on the other, and — because the row sets they
+claim are disjoint by construction — no row is ever processed by both. This
+is the entire mechanism behind "two poller instances running → no
+double-publish, no row processed twice"; nothing else coordinates between the
+two processes, and nothing else needs to.
+
+### 34. Deterministic document IDs are what makes at-least-once delivery safe
+
+The ES document `_id` is the event's own Postgres id (`searchDocId`), not an
+autogenerated one. This is the whole reason "kill the poller mid-batch,
+restart → no duplicate documents" is achievable without any de-duplication
+logic: if the process dies before `COMMIT`, Postgres rolls back the entire
+open transaction, so none of that batch's rows got marked `published_at`, and
+their locks release for the next attempt to reclaim. That next attempt
+re-indexes the same events — but "index with `_id: 7`" is a PUT, and a second
+PUT with the same id overwrites the first rather than creating a second
+document. At-least-once delivery is only safe to build when the operation it
+retries is idempotent; a deterministic id is what makes indexing idempotent
+here.
+
+### 35. Per-row apply-and-mark inside one open transaction, not one batch-level commit
+
+Each claimed row is applied to Elasticsearch and marked published individually,
+still inside the single transaction the whole batch runs in — not applied in
+memory first and marked with one final bulk `UPDATE`. This matters for the two
+failure modes the acceptance criteria name separately:
+- **Elasticsearch down:** every row in the batch fails identically, none get
+  marked, and the transaction still commits — harmlessly, since committing zero
+  `UPDATE`s changes nothing. The rows stay claimed-but-unpublished and are
+  reclaimed on the next tick. The original Postgres write this poller is
+  draining was never in question — it already committed, independently, before
+  this poller ever saw the row — so "ES down → event write to Postgres still
+  succeeds" is true by construction, not something this poller has to arrange.
+- **One malformed row among many healthy ones:** only that row's `try/catch`
+  catches the failure; the rows around it that succeeded keep their individual
+  `UPDATE`s, which the shared `COMMIT` then persists. A batch-level
+  catch-and-rollback would have thrown away every good write in the batch to
+  protect against one bad one.
+
+### 36. Delete is a real ES delete, not a soft `isDeleted` flag on the document
+
+`event.deleted` triggers `esClient.delete`, removing the document outright.
+Flagging it instead (`isDeleted: true` + filtering every query) would need
+every future query — including ones nobody has written yet — to remember to
+add that filter, and a query that forgets it silently returns a deleted event.
+A hard delete makes "removed from search results" true of every possible
+query with nothing to remember; there is also no legitimate reason to search
+for a deleted event through this index; whoever needs that Postgres's own
+`is_deleted` column already carries it.
+
+---
+
 ## Still open
 
 - **Why holds are in Redis and bookings are in Postgres** — argued in (4) and (7);

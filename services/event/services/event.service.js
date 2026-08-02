@@ -14,16 +14,36 @@ import {
     lockEvent,
     venueExistsActive,
     performerExists,
+    getVenueSearchFields,
+    getPerformerName,
     countBookedTickets,
     countLiveBookings,
 } from "../repositories/event.repository.js";
 
-const emit = (client, type, event) =>
+const emit = (client, type, event, extra) =>
     insertOutboxEvent(client, {
         aggregateType: "event",
         aggregateId: event.id,
-        payload: { type, event },
+        payload: { type, event, ...extra },
     });
+
+// Denormalizes venue/performer name (+ venue location) onto the outbox payload
+// at write time, so the search index poller never needs its own join back to
+// `venues`/`performers` — its only table is the outbox. Read with
+// getVenueSearchFields/getPerformerName, not venueExistsActive/performerExists:
+// those filter out a since-retired venue, which is correct for validating a
+// *new* choice but wrong here — an existing event's search document must keep
+// showing its venue's name even after that venue is soft-deleted, same as
+// getEventById's join already does for the read API.
+const searchEnrichment = async (client, venueId, performerId) => {
+    const venue = await getVenueSearchFields(client, venueId);
+    const performerName = await getPerformerName(client, performerId);
+    return {
+        venueName: venue?.name ?? null,
+        venueLocation: venue?.location ?? null,
+        performerName,
+    };
+};
 
 export const createEvent = async (input) => {
     try {
@@ -38,7 +58,8 @@ export const createEvent = async (input) => {
             }
 
             const event = await insertEvent(client, input);
-            await emit(client, "event.created", event);
+            const enrichment = await searchEnrichment(client, event.venueId, event.performerId);
+            await emit(client, "event.created", event, enrichment);
             return event;
         });
     } catch (error) {
@@ -121,7 +142,11 @@ export const editEvent = async (id, changes) => {
             if (!event) {
                 throw createApiError(`Event ${id} not found`, 404);
             }
-            await emit(client, "event.updated", event);
+            // Re-fetched for whichever venue/performer the event now points at,
+            // whether or not this particular edit touched them — a `name`-only
+            // update must not leave the search document's venue/performer stale.
+            const enrichment = await searchEnrichment(client, event.venueId, event.performerId);
+            await emit(client, "event.updated", event, enrichment);
             return event;
         });
 

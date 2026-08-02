@@ -163,6 +163,24 @@ services:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
 
+  # Worker, not an HTTP service — no ports, no gateway route. Reads the outbox
+  # table Event Service writes to and drains it into Elasticsearch.
+  outbox-poller:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/outbox-poller/Dockerfile
+    environment:
+      <<: *postgres-env
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+    # Postgres is not optional here — every batch this worker runs reads the
+    # outbox table, so it waits for a healthy Postgres like event/booking do.
+    # Elasticsearch stays service_started: the poller must come up with ES down
+    # and drain once it recovers, same reasoning as Search Service.
+    depends_on:
+      postgres: { condition: service_healthy }
+      elasticsearch: { condition: service_started }
+
 networks:
   internal:
 

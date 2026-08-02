@@ -161,6 +161,28 @@ export const performerExists = async (client, id) => {
     return rows.length > 0;
 };
 
+// Denormalization reads for the outbox payload — deliberately separate from
+// venueExistsActive above and without its `NOT is_deleted` filter. That filter
+// exists to validate a *newly chosen* venue on write; a venue retired after an
+// event was created must still enrich that event's search document with its
+// name, the same "retired venue must not make its events vanish" rule
+// getEventById already follows for the read API.
+export const getVenueSearchFields = async (client, id) => {
+    const { rows } = await client.query(
+        `SELECT name, location FROM venues WHERE id = $1`,
+        [id]
+    );
+    return rows[0] ?? null;
+};
+
+export const getPerformerName = async (client, id) => {
+    const { rows } = await client.query(
+        `SELECT name FROM performers WHERE id = $1`,
+        [id]
+    );
+    return rows[0]?.name ?? null;
+};
+
 export const countBookedTickets = async (client, id) => {
     const { rows } = await client.query(
         `SELECT count(*)::int AS count FROM tickets

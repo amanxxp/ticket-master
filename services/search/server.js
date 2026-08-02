@@ -1,14 +1,21 @@
 import "dotenv/config";
 import app from "./app.js";
+import { ensureSearchIndex } from "./config/elasticsearch.js";
 
 const PORT = Number(process.env.PORT) || 3003;
 
 const startServer = async () => {
     try {
-        // Week 3 Day 3 adds the Elasticsearch client and a ping here. Deliberately
-        // not a startup dependency: this service must come up with ES down, serve
-        // 503 on search, and recover on its own — search staleness is acceptable,
-        // a service that refuses to boot is not.
+        // Best-effort, not awaited-to-fail: a listen() that depended on this
+        // would contradict the service's own contract of booting with ES down
+        // and recovering on its own. If ES is up, the index is ready before the
+        // first request; if not, ensureSearchIndex is retried by the poller and
+        // by later restarts — a search request against a missing index is a
+        // clean ES 404 the service already maps to its own error shape.
+        ensureSearchIndex().catch((err) =>
+            console.error("Could not ensure search index (will retry lazily):", err.message)
+        );
+
         const server = app.listen(PORT, () => {
             console.log(`Search service listening on port ${PORT}`);
         });
