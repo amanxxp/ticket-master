@@ -933,6 +933,60 @@ auth layer checks and this endpoint has no JWT to check in the first place.
 
 ---
 
+## Week 5 Day 1 — Queue join + position
+
+### 53. Queue position is a Redis-side INCR sequence, not a timestamp score
+
+A timestamp score risks ties: two joins landing in the same millisecond would
+score identically, and `ZRANK` doesn't define a stable order between tied
+members — whichever the tie resolves to could go either way on a re-read,
+which is a monotonicity bug hiding in plain sight. An `INCR`-backed sequence
+counter can't tie, at any request rate, because Redis serializes it — this is
+what makes "position never increases across polls" provable rather than
+merely usually-true. It also makes the join-or-return-existing check
+(`ZSCORE` then, only on a miss, `INCR`+`ZADD`) safe to express as one Lua
+script: the atomicity is what stops two concurrent joins from the same user
+both observing "not yet a member" and both inserting a second entry.
+
+### 54. The queue token is a second, separate credential from the login JWT — on purpose
+
+Booking Service already trusts `X-User-Id` as the caller's real identity
+(gateway-injected, per Week 4). The queue token doesn't re-assert identity —
+it asserts *slot ownership*: "this specific login, at this specific event,
+holds a specific place in line." Two independent signals only in combination
+make token theft detectable: the token's own `sub`/`eventId` claims, checked
+against the *real*, independently-verified `X-User-Id` for the request. A
+design that trusted the token's claims alone (no cross-check against the real
+caller) would let a stolen token work perfectly for whoever holds it — it
+would still verify, still decode a valid userId, just not the *right* one.
+The 401 fires specifically because the two signals disagree, not because
+either one alone was invalid.
+
+### 55. Both mismatch cases are 401, not 403 or 404
+
+A token bound to someone else's userId, or to a different event, is neither
+"you're not allowed" (403 — that implies the identity is right and the
+privilege is missing) nor "no such queue entry" (404 — that implies the
+request was honest but the resource isn't there). It's "this credential
+doesn't prove what you're claiming it proves" — the same shape of failure a
+tampered access token is, elsewhere in this system, which is also 401.
+Consistency here matters for a client: every "your credential is wrong"
+failure across the whole API answers the same way.
+
+### 56. ETA is a real range from two measured windows, or an honest "no data" — never `position / assumed_rate`
+
+Two window sizes (a longer baseline, a shorter recent one) produce two
+different measured rates from the *same* underlying departure data —
+`countRecentDepartures` over each window — which is what turns "an ETA" into
+an actual range instead of one number with invented confidence. Before Day 2's
+admitter exists, nobody ever departs the queue, so both windows read zero and
+`estimateEta` returns `etaSecondsMin/Max: null` with a message, not `Infinity`
+or a silently-wrong number — a caller checking `if (etaSecondsMax)` gets a
+real signal that no estimate is available yet, rather than a value that looks
+computed but isn't grounded in anything.
+
+---
+
 ## Still open
 
 - **Why holds are in Redis and bookings are in Postgres** — argued in (4) and (7);

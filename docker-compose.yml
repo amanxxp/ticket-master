@@ -165,6 +165,9 @@ services:
       HOLD_TTL_SECONDS: 600
       STRIPE_SECRET_KEY: sk_test_changeme
       STRIPE_WEBHOOK_SECRET: whsec_changeme
+      QUEUE_TOKEN_SECRET: dev-only-change-me
+      QUEUE_TOKEN_TTL_SECONDS: 3600
+      QUEUE_DRAIN_WINDOW_MS: 300000
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
