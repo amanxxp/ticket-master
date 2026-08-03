@@ -168,6 +168,31 @@ services:
       QUEUE_TOKEN_SECRET: dev-only-change-me
       QUEUE_TOKEN_TTL_SECONDS: 3600
       QUEUE_DRAIN_WINDOW_MS: 300000
+      ADMISSION_TOKEN_SECRET: dev-only-change-me
+      ADMISSION_TTL_SECONDS: 900
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  # Worker, not an HTTP service — pops each event's waiting queue and grants
+  # admission. Run with `docker compose up --scale admitter=2` to exercise the
+  # "two admitters, still no over-admission" acceptance test: the leader lease
+  # in repositories/leader.repository.js ensures only one replica's tick ever
+  # touches a given event's queue at a time.
+  admitter:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/admitter/Dockerfile
+    environment:
+      <<: *postgres-env
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      ADMISSION_TTL_SECONDS: 900
+      QUEUE_DRAIN_WINDOW_MS: 300000
+      OVERBOOKING_FACTOR: 1.1
+      ADMITTER_LEASE_MS: 10000
+      ADMITTER_TICK_MS: 2000
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }

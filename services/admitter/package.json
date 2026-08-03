@@ -1,0 +1,18 @@
+{
+  "name": "admitter",
+  "version": "1.0.0",
+  "description": "Pops the waiting queue and grants admission into the booking flow. No HTTP surface.",
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "main": "admitter.js",
+  "scripts": {
+    "start": "node admitter.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "pg": "^8.22.0",
+    "redis": "^6.1.0"
+  }
+}

@@ -987,6 +987,83 @@ computed but isn't grounded in anything.
 
 ---
 
+## Week 5 Day 2 — Admitter + admission gate
+
+### 57. Admission is a self-contained signed token, not a Redis-backed check — that's the whole trick behind "403 with zero Redis calls"
+
+`POST /bookings/reserve|confirm` reject on missing/invalid admission before
+touching Redis or Postgres at all, for the same reason the queue token
+already worked this way: `jwt.verify` is pure signature/claims checking, no
+store access. If admission were instead "look up whether this userId is in
+the admitted set," the reject path could never be Redis-free — checking
+"not admitted" requires a Redis read exactly as much as checking "admitted"
+does. Making the token itself the proof sidesteps the question: the *check*
+performed by `requireAdmission` never needs to know what Redis thinks, only
+whether the caller can produce a token that verifies with the right claims.
+The Redis-backed admitted-set still exists and still matters — it's what
+`GET /queue/position` reads to decide *whether to issue* a token in the first
+place — but that read happens on a different endpoint, not on the gate that
+this acceptance criterion is about.
+
+### 58. Admission's own JWT expiry is tied to `ADMISSION_TTL_SECONDS`, not independent
+
+The admission token (`utils/admissionToken.js`) and the Redis admitted-ZSET
+entry it represents (`shared/queue.js`'s `admittedKey`) share one constant.
+An independent, longer token expiry would let a caller pass the gate after
+the admitter had already reclaimed their slot and handed it to someone else —
+the token would still verify, but the budget accounting it's supposed to
+represent would already be a lie. An independent, shorter expiry would reject
+a caller Redis still considers legitimately admitted. Same window, same
+store, so the two cannot drift apart in either direction.
+
+### 59. The leader lease is fenced by instance id — plain `SET NX` is the wrong primitive here
+
+A bare `SET key val NX PX lease` only succeeds when the key is absent, which
+would force the *current, healthy* leader's own periodic renewal to fail too
+(the key already exists — it set it) — re-electing on every tick even with
+no failure at all. `acquireOrRenewLease` instead succeeds when the key is
+absent **or** already held by this exact instance, which is what lets one
+function serve both "become leader" and "stay leader." A second instance's
+attempt only ever succeeds once the current holder's key has genuinely
+expired or been released — this is the entire mechanism behind "two admitter
+processes running, still no over-admission": at most one instance's tick can
+ever pass this check and go on to call `admitBatch`.
+
+Release (SIGTERM) is fenced the same way, for a different reason: an
+unconditional `DEL` on shutdown would risk deleting a **newer** leader's key,
+if this instance's own lease had already silently expired (e.g. a long GC
+pause) and someone else had already taken over before this shutdown handler
+ran. Checking "is the recorded holder still me" before deleting is what makes
+unconditional release-on-every-shutdown safe to do without a separate
+"am I even still leader" round trip first.
+
+### 60. Why `admitBatch` also feeds the drain-rate measurement Day 1 built and never used
+
+Admission is the event that actually removes someone from the waiting
+queue — releases and expiries aside, it's the *only* thing that does, in this
+system's current scope. Day 1's ETA math (`countRecentDepartures`) was built
+against a `departures` ZSET with nothing populating it, honestly reporting
+"not enough data" the whole time. `admitBatch` recording each admitted user
+into that same ZSET is what turns Day 1's honest-but-empty measurement into a
+real one: "the queue drains at the rate seats actually free" is true
+specifically because the rate being measured *is* the admission rate, not a
+separately-invented one.
+
+### 61. The overbooking factor is config, not a fixed rate, and here is the number being defended
+
+`OVERBOOKING_FACTOR = 1.1` (10%) is a starting default tuned from an assumed
+no-show rate, not a derived constant — the property worth defending is not
+"1.1 is correct" (nobody has real conversion data for this system yet) but
+that it is **a named, changeable value**, not a magic number woven into the
+budget formula. `computeBudget` = `floor(available * factor) − activeAdmissions`.
+Setting it too high risks real overselling if more admitted users convert
+than expected; too low leaves the checkout funnel under-full while seats sit
+unsold. The correct value is an operational tuning decision made from
+observed conversion data over time, not a constant this code should have
+opinions about beyond making it one line to change.
+
+---
+
 ## Still open
 
 - **Why holds are in Redis and bookings are in Postgres** — argued in (4) and (7);

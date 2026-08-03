@@ -1,7 +1,14 @@
 import { createApiError } from "../utils/apiError.js";
 import { signQueueToken, verifyQueueToken } from "../utils/queueToken.js";
+import { signAdmissionToken } from "../utils/admissionToken.js";
 import { getEvent } from "../repositories/booking.repository.js";
-import { joinQueue, getPosition, countRecentDepartures } from "../repositories/queue.repository.js";
+import {
+    joinQueue,
+    getPosition,
+    countRecentDepartures,
+    isAdmitted,
+    isSoldOut,
+} from "../repositories/queue.repository.js";
 
 // Two window sizes rather than one — a long baseline and a shorter recent
 // signal — so the two rates they produce can genuinely differ instead of one
@@ -27,9 +34,9 @@ export const join = async ({ eventId, userId }) => {
 };
 
 // No departures observed yet in EITHER window is reported as exactly that —
-// not `position / assumed_rate`. Before Day 2's admitter exists, this is
-// always the case; the honest answer is "not enough data," not a number that
-// looks precise but is actually a guess dressed up as a measurement.
+// not `position / assumed_rate`. Before the admitter runs, this is always the
+// case; the honest answer is "not enough data," not a number that looks
+// precise but is actually a guess dressed up as a measurement.
 const estimateEta = async (eventId, position) => {
     const [longCount, shortCount] = await Promise.all([
         countRecentDepartures(eventId, LONG_WINDOW_MS),
@@ -72,10 +79,26 @@ export const getQueuePosition = async ({ eventId, userId, token }) => {
     }
 
     const position = await getPosition(eventId, userId);
-    if (position === null) {
-        throw createApiError("You are not in this event's queue", 404);
+    if (position !== null) {
+        const eta = await estimateEta(eventId, position);
+        return { status: "waiting", position, ...eta };
     }
 
-    const eta = await estimateEta(eventId, position);
-    return { position, ...eta };
+    // No longer in the waiting ZSET — the admitter (a separate process) is the
+    // only thing that removes members, and it does so for exactly one of two
+    // reasons: it let this user in, or the event sold out and drained
+    // everyone. Checked in this order because a race where both happen to be
+    // true (sold out right as this user was admitted) should still favor
+    // telling them the good news — they have a real, usable admission token.
+    if (await isAdmitted(eventId, userId)) {
+        const admissionToken = signAdmissionToken({ userId, eventId });
+        return { status: "admitted", admissionToken };
+    }
+    if (await isSoldOut(eventId)) {
+        return { status: "sold_out" };
+    }
+
+    // Neither admitted nor sold out, and not waiting — this user was never in
+    // this event's queue at all.
+    throw createApiError("You are not in this event's queue", 404);
 };

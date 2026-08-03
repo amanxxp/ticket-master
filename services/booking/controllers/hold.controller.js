@@ -1,6 +1,7 @@
 import * as holdService from "../services/hold.service.js";
 import { responseHandler } from "../utils/response.js";
 import { requireUserId, validateReserve } from "../validators/booking.validator.js";
+import { requireAdmission } from "../middlewares/requireAdmission.js";
 import { decodeHoldId } from "../utils/holdId.js";
 import { getLiveHolds } from "../repositories/hold.repository.js";
 import { createApiError } from "../utils/apiError.js";
@@ -8,6 +9,9 @@ import { createApiError } from "../utils/apiError.js";
 export const reserveTickets = async (req, res) => {
     const userId = requireUserId(req);
     const { eventId, ticketIds } = validateReserve(req.body);
+    // Zero Redis/DB calls above this line, and none in requireAdmission
+    // itself — the reject path for "no admission" never touches a store.
+    requireAdmission(req, userId, eventId);
 
     const hold = await holdService.reserve({ userId, eventId, ticketIds, correlationId: req.correlationId });
 

@@ -1,9 +1,13 @@
 import redis from "../config/redis.js";
 import { REDIS_TIME_LUA } from "../../../shared/availability.js";
-
-const queueKey = (eventId) => `queue:{evt:${eventId}}`;
-const seqKey = (eventId) => `queue:{evt:${eventId}}:seq`;
-const departuresKey = (eventId) => `queue:{evt:${eventId}}:departures`;
+import {
+    queueKey,
+    queueSeqKey,
+    departuresKey,
+    admittedKey,
+    soldOutKey,
+    ACTIVE_QUEUES_KEY,
+} from "../../../shared/queue.js";
 
 // Atomic join-or-return-existing in one round trip: ZSCORE-then-ZADD as two
 // separate commands would let two concurrent joins from the SAME user both
@@ -16,7 +20,13 @@ const departuresKey = (eventId) => `queue:{evt:${eventId}}:departures`;
 // guarantee arrival order. A sequence counter can't collide regardless of
 // clock resolution, which is what makes "position never increases" provable:
 // nobody already in the ZSET can ever be assigned a lower score after the fact.
+//
+// Also SADDs eventId into the global active-queues registry — this is how the
+// admitter (a separate process) discovers which events have anyone waiting,
+// without ever scanning the keyspace.
 const JOIN_LUA = `
+redis.call('SADD', KEYS[3], ARGV[2])
+
 local existing = redis.call('ZSCORE', KEYS[1], ARGV[1])
 if existing then
   local rank = redis.call('ZRANK', KEYS[1], ARGV[1])
@@ -31,24 +41,25 @@ return cjson.encode({ joined = true, position = rank + 1 })
 
 export const joinQueue = async (eventId, userId) => {
     const raw = await redis.eval(JOIN_LUA, {
-        keys: [queueKey(eventId), seqKey(eventId)],
-        arguments: [userId],
+        keys: [queueKey(eventId), queueSeqKey(eventId), ACTIVE_QUEUES_KEY],
+        arguments: [userId, String(eventId)],
     });
     return JSON.parse(raw);
 };
 
-// null means "not in the queue" — either never joined, or already departed
-// (admitted, expired, or the event sold out and drained them). The caller
-// turns that into 404, not a fabricated position.
+// null means "not currently waiting" — either never joined, or already
+// departed (admitted, or the event sold out and drained the queue). The
+// caller (queue.service.js) checks admission/sold-out state separately before
+// deciding this means 404.
 export const getPosition = async (eventId, userId) => {
     const rank = await redis.zRank(queueKey(eventId), userId);
     return rank === null ? null : rank + 1;
 };
 
 // Removes the user from the live queue and records the departure for the
-// drain-rate measurement below. Nothing in Day 1's own scope calls this yet —
-// there is no admitter until Day 2 — but the read side (drain rate / ETA) is
-// built against this real data shape now, not a stubbed one swapped later.
+// drain-rate measurement below. Called by the admitter (admission) — Day 1
+// built the read side (drain rate / ETA) against this real data shape before
+// anything existed to call it; Day 2 is that caller.
 const RECORD_DEPARTURE_LUA = `
 ${REDIS_TIME_LUA}
 redis.call('ZREM', KEYS[1], ARGV[1])
@@ -77,3 +88,18 @@ export const countRecentDepartures = async (eventId, windowMs) => {
 };
 
 export const getQueueLength = async (eventId) => redis.zCard(queueKey(eventId));
+
+// Written by the admitter; read here so GET /queue/position can tell a caller
+// who's left the waiting ZSET *why* — admitted (issue them a token) versus
+// sold out (tell them plainly) versus neither (a genuine 404).
+// `ZSCORE > now` mirrors the hold ZSETs' own "score carries expiry" check —
+// an entry past its score is not live, whether or not anything has purged it.
+export const isAdmitted = async (eventId, userId) => {
+    const score = await redis.zScore(admittedKey(eventId), userId);
+    return score !== null && Number(score) > Date.now();
+};
+
+export const isSoldOut = async (eventId) => {
+    const flag = await redis.get(soldOutKey(eventId));
+    return flag === "1";
+};
