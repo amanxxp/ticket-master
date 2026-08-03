@@ -1,7 +1,13 @@
 import { createApiError } from "../utils/apiError.js";
 import { hashPassword, verifyPassword, verifyAgainstDummyHash } from "../utils/password.js";
 import { signAccessToken, generateRefreshToken, hashRefreshToken } from "../utils/tokens.js";
-import { insertUser, getUserByEmail, getUserById } from "../repositories/user.repository.js";
+import {
+    insertUser,
+    insertUserWithRole,
+    updateUserRole,
+    getUserByEmail,
+    getUserById,
+} from "../repositories/user.repository.js";
 import { insertRefreshToken, getActiveRefreshToken, revokeRefreshToken } from "../repositories/refreshToken.repository.js";
 
 const UNIQUE_VIOLATION = "23505";
@@ -73,4 +79,28 @@ export const refresh = async ({ refreshToken }) => {
 // row that doesn't match just updates zero rows.
 export const logout = async ({ refreshToken }) => {
     await revokeRefreshToken(hashRefreshToken(refreshToken));
+};
+
+// The privileged counterpart to register() — the only place role is ever
+// accepted from a request. Reachable only through a gateway route policed to
+// `roles: ["admin"]`; nothing in this function re-derives that guarantee, so
+// it must never be wired to a route the gateway hasn't gated the same way.
+export const adminCreateUser = async ({ email, password, role }) => {
+    const passwordHash = await hashPassword(password);
+    try {
+        return await insertUserWithRole({ email, passwordHash, role });
+    } catch (error) {
+        if (error.code === UNIQUE_VIOLATION) {
+            throw createApiError(`Email ${email} is already registered`, 409);
+        }
+        throw error;
+    }
+};
+
+export const changeUserRole = async ({ id, role }) => {
+    const user = await updateUserRole(id, role);
+    if (!user) {
+        throw createApiError(`User ${id} not found`, 404);
+    }
+    return user;
 };

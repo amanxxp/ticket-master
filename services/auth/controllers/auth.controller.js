@@ -1,5 +1,6 @@
 import * as authService from "../services/auth.service.js";
 import { responseHandler } from "../utils/response.js";
+import { createApiError } from "../utils/apiError.js";
 
 export const register = async (req, res) => {
     const { email, password } = req.body;
@@ -23,4 +24,22 @@ export const logout = async (req, res) => {
     const { refreshToken } = req.body;
     await authService.logout({ refreshToken });
     return responseHandler(null, res, "Logged out", 200);
+}
+
+// Gateway-gated to roles:["admin"] (policy.js) — this handler trusts that and
+// does not re-check X-User-Role itself; it is not wired to any other route.
+export const adminCreateUser = async (req, res) => {
+    const { email, password, role } = req.body;
+    const user = await authService.adminCreateUser({ email, password, role });
+    return responseHandler(user, res, "User created", 201);
+}
+
+export const updateUserRole = async (req, res) => {
+    const { id } = req.params;
+    if (!/^\d+$/.test(id)) {
+        throw createApiError("id must be a positive integer", 422);
+    }
+    const { role } = req.body;
+    const user = await authService.changeUserRole({ id, role });
+    return responseHandler(user, res, "Role updated", 200);
 }

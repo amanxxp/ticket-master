@@ -16,6 +16,30 @@ export const insertUser = async ({ email, passwordHash }) => {
     return rows[0];
 };
 
+// Unlike insertUser, role IS a parameter — this is the admin-only path
+// (services/auth/services/auth.service.js#adminCreateUser), gated at the
+// gateway to `roles: ["admin"]` before it ever reaches here. Kept as a
+// separate function rather than an optional param on insertUser so the
+// privileged path is never one flag away from being reachable by accident
+// from the public register() call site.
+export const insertUserWithRole = async ({ email, passwordHash, role }) => {
+    const { rows } = await pool.query(
+        `INSERT INTO users (email, password_hash, role)
+         VALUES ($1, $2, $3)
+         RETURNING ${USER_COLUMNS}`,
+        [email, passwordHash, role]
+    );
+    return rows[0];
+};
+
+export const updateUserRole = async (id, role) => {
+    const { rows } = await pool.query(
+        `UPDATE users SET role = $2 WHERE id = $1 RETURNING ${USER_COLUMNS}`,
+        [id, role]
+    );
+    return rows[0] ?? null;
+};
+
 // Includes password_hash — the one place in this repository that's allowed to
 // return it, since login is the one caller that needs it to compare against.
 export const getUserByEmail = async (email) => {

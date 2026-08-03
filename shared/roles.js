@@ -9,3 +9,9 @@ export const ROLES = ["user", "organizer", "admin"];
 // the gateway's route policy has one definition of "who can write inventory,"
 // not a list re-typed at every route entry.
 export const MANAGER_ROLES = ["organizer", "admin"];
+
+// Roles allowed to create a user with an arbitrary role, or change an
+// existing user's role. A one-element array, not a bare string, so
+// policy.js's `roles.includes(...)` check works identically for every
+// roles-gated route regardless of how many roles it allows.
+export const ADMIN_ROLES = ["admin"];

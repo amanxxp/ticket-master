@@ -1,4 +1,4 @@
-import { MANAGER_ROLES } from "../../../shared/roles.js";
+import { MANAGER_ROLES, ADMIN_ROLES } from "../../../shared/roles.js";
 
 // `:param` matches exactly one path segment (no slash) — this is what keeps
 // `/events/:id` from ever matching `/events/:eventId/tickets` (three segments
@@ -27,6 +27,12 @@ export const ROUTE_POLICIES = [
     { method: "POST", path: "/auth/login", auth: "none" },
     { method: "POST", path: "/auth/refresh", auth: "none" },
     { method: "POST", path: "/auth/logout", auth: "none" },
+
+    // ---- admin-only user management ---- INFERRED (no such endpoint in the
+    // original spec at all; added on request, gated the same way any other
+    // privileged write is — auth required, role checked before proxying)
+    { method: "POST", path: "/auth/admin/users", auth: "required", roles: ADMIN_ROLES },
+    { method: "PUT", path: "/auth/admin/users/:id/role", auth: "required", roles: ADMIN_ROLES },
 
     // ---- explicit exemption: signature verification happens in Booking Service ---- SPEC
     { method: "POST", path: "/webhooks/stripe", auth: "none", rateLimited: false },
