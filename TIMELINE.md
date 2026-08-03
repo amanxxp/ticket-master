@@ -11,17 +11,26 @@
 
 ## ▶ You are here
 
-**Week 2, Day 2 — `GET /events/:id/seatmap` on Event Service.**
+**Week 5, Day 3 — fairness: registration window + randomized draw.**
 
-Day 1 done: reserve + release, 30/30 acceptance checks passing, real TTL expiry verified across two instances. Key naming and expiry semantics settled in `shared/availability.js`; decisions 6–10 written up.
+Done through Week 5 Day 2. `DECISIONS.md` runs to **#61**; its highest entry number is the reliable progress signal, not this marker.
 
-Clear first, untimed:
-- ☐ `scripts/redis-counter.js` — Day 2's **only** real criterion is a round-trip count; can't assert it without this
-- ☐ `docker-compose up -d postgres redis` (use `docker-compose`, the `docker compose` plugin isn't installed here)
+| Week | Built |
+|---|---|
+| 1 | CRUD (event/venue/ticket), booking confirm, 3-layer double-book guard |
+| 2 | Redis holds + cap, seat map, SSE fan-out via Redis pub/sub |
+| 3 | Keyset + offset pagination, event cache, Elasticsearch, outbox CDC poller |
+| 4 | Gateway proxy + policy table, auth (JWT + refresh), authz, sliding-window rate limiter, correlation IDs |
+| 5 | Day 1 queue join + position · Day 2 admitter worker, leader lease, admission token |
 
-Day 2 composes ticket rows from Postgres with the live-hold ZSET read. `getLiveHolds` in `services/booking/repositories/hold.repository.js` is the shape to move into `shared/availability.js` — Event Service must read the same structures, never write them.
+**Day 3:** `score = hash(userId, eventSeed)`, seed generated at sale-open. Position must be uncorrelated with join time — prove it with a correlation check over 1000 sequential registrants, not by eye. Seed unguessable before open. Keep FIFO behind a flag for comparison.
 
-Week 1 carry-over, if not already done: the 50-concurrent test (1× 201 / 49× 409), the guard-removal variant, and the Day 4 cold rebuild.
+Then Day 4 (cancel + waitlist) and Day 5 (10k-join load test) close Week 5.
+
+Still open from earlier weeks, carried deliberately:
+- ☐ `scripts/redis-counter.js` — Week 2 Day 2's round-trip criterion was never asserted with an instrumented counter
+- ☐ no automated test suite is committed; verification has been throwaway scripts
+- ☐ cold rebuilds (W1 D4, W2 D4) — check the retest ledger below before claiming a component learned
 
 Move this marker down as you finish each day.
 

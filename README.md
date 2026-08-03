@@ -45,19 +45,14 @@ Read-heavy with violently spiky writes: a popular event goes from idle to 100:1 
 |-----|--------------|
 | [REQUIREMENTS.md](REQUIREMENTS.md) | Cold-build learning spec — domain model, invariants, per-day acceptance criteria |
 | [TIMELINE.md](TIMELINE.md) | 6-week dated schedule, time boxes, retest ledger |
-| [DECISIONS.md](DECISIONS.md) | Locked choices and the one-line reason for each |
-| [BLOCKERS.md](BLOCKERS.md) | Weekly blockers log + wrong predictions from the failure-injection drill |
-| [docs/architecture.md](docs/architecture.md) | Component responsibilities, request flows, why the split is where it is |
-| [docs/api.md](docs/api.md) | Full HTTP API reference |
-| [docs/data-model.md](docs/data-model.md) | PostgreSQL schema, indexes, DDL, the three double-book guards |
-| [docs/holds-and-seatmap.md](docs/holds-and-seatmap.md) | Redis hold structures, O(1) seat-map read, SSE fan-out |
-| [docs/waiting-room.md](docs/waiting-room.md) | Admission control, leader election, fairness policy, waitlist |
-| [docs/payments.md](docs/payments.md) | Idempotency, webhooks, refunds, reconciliation |
-| [docs/search.md](docs/search.md) | Elasticsearch mapping, query DSL, transactional outbox CDC |
-| [docs/scaling.md](docs/scaling.md) | Capacity estimates, bottlenecks, failure modes |
-| [docs/deployment.md](docs/deployment.md) | Running locally, env vars, ports, Docker Compose, ops runbook |
+| [DECISIONS.md](DECISIONS.md) | Every non-obvious choice and why — 60+ numbered entries. **Grep it, don't read it** |
+| [CLAUDE.md](CLAUDE.md) | Orientation for AI agents: conventions, layering, where the shape deviates |
 
-REQUIREMENTS and TIMELINE exist now. Everything else gets written as you build the thing it describes — a doc for a component you haven't built yet is fiction.
+Those four are the whole documentation set. There is no `docs/` directory —
+architecture, data model, hold semantics, and the waiting-room design are all
+argued in `DECISIONS.md` next to the decision that produced them, which is
+where they stay current. A separate `docs/` tree would be a second place to
+forget to update.
 
 ## Stack
 
@@ -157,63 +152,72 @@ ticket-master-server/
 ├── README.md
 ├── REQUIREMENTS.md          # cold-build learning spec
 ├── TIMELINE.md              # 6-week dated schedule
-├── DECISIONS.md             # locked choices + one-line reasons
-├── BLOCKERS.md              # weekly log + wrong predictions
+├── DECISIONS.md             # every non-obvious choice + why. Grep it, don't read it
+├── CLAUDE.md                # orientation for AI agents working in this repo
 ├── docker-compose.yml       # datastores by default; --profile full adds services
 ├── .dockerignore
-├── package.json             # npm workspace root
+├── package.json             # root tooling only (seed/reset/hammer). NOT a workspace root
 ├── db/
-│   └── schema.sql           # migrations replace this (Week 0 item, still open)
-├── docs/                    # written as each component is built
-├── scripts/
-│   ├── seed.js              # 50-ticket event + 50,000-ticket event
-│   ├── reset.sh             # truncate bookings, free tickets, flush redis
-│   └── concurrency-harness.js   # N parallel requests, tallies status codes
-├── shared/                  # workspace package @tm/shared
-│   ├── package.json
-│   └── availability.js      # hold key names, expiry semantics, Lua helpers
-├── services/
-│   ├── gateway/             # 3000 — authn/authz, rate-limit, routing
-│   ├── auth/                # 3001 — register, login, refresh, logout
-│   ├── event/               # 3002 — CRUD, cache, seat map, SSE
-│   ├── search/              # 3003 — Elasticsearch queries
-│   └── booking/             # 3004 — reserve, confirm, cancel, queue, Stripe
-└── workers/                 # Week 3 / Week 5
-    ├── outbox-poller/       # Postgres → Elasticsearch
-    └── admitter/            # drains queue, single-leader
+│   └── schema.sql           # entire schema, one file, no migration tool
+├── scripts/                 # run via npm from the repo root
+│   ├── seed.js                      # npm run seed  — small event + 50,000-ticket event
+│   ├── reset.sh                     # npm run reset — wipe Postgres + Redis
+│   ├── concurrency-harness.js       # npm run hammer
+│   └── booking-concurrency-test.js  # booking-confirm acceptance script
+├── shared/                  # cross-service contracts, imported by relative path
+│   ├── availability.js      # hold keys, expiry, readLiveHolds, pub/sub channels
+│   ├── queue.js             # waiting-room key naming
+│   ├── searchIndex.js       # ES index/mapping + toSearchDocument
+│   ├── correlationId.js     # header name + generate-or-reuse
+│   ├── httpError.js         # status → error-code mapping
+│   └── roles.js             # role list + role groups
+└── services/
+    ├── gateway/       :3000  # only process with a published port
+    ├── auth/          :3001
+    ├── event/         :3002  # CRUD, cache, seat map, SSE
+    ├── search/        :3003
+    ├── booking/       :3004  # reserve, confirm, holds, queue
+    ├── admitter/             # worker, no inbound port — drains queue, leader lease
+    └── outbox-poller/        # worker, no inbound port — Postgres → Elasticsearch
 ```
+
+Workers live under `services/` alongside the HTTP services rather than in a
+separate `workers/` tree — same internal conventions (`config/`,
+`repositories/`, `services/`), just no `app.js` or `routes/`.
 
 Each service has the same internal shape:
 
 ```
 services/booking/
 ├── Dockerfile               # build context is the REPO ROOT, not this dir
-├── package.json             # own deps; @tm/shared where needed
-├── server.js                # connect stores, listen, graceful shutdown
-├── app.js                   # express app, /health, router, error handler
+├── package.json             # own deps, own node_modules
+├── server.js                # dotenv, connect stores, listen, graceful shutdown
+├── app.js                   # express app, /health, middleware chain, router
 ├── config/                  # db.js, redis.js — clients and pool sizes
 ├── routes/                  # thin, path → controller
 ├── controllers/             # identity + validation + status codes
 ├── services/                # order of operations, maps results to errors
 ├── repositories/            # SQL and Lua. Never throws HTTP errors
 ├── validators/              # runs before any datastore call
-├── middlewares/             # errorHandler
+├── middlewares/             # correlationId, requestLogger, errorHandler
 └── utils/                   # apiError, response, transaction, money, holdId
 ```
 
 Four things worth knowing about this layout:
 
-**Every service is independently buildable and deployable.** One image per service, own port, own container. Dockerfiles take the **repo root** as build context, because services import `@tm/shared` from outside their own folder:
+**Every service is independently buildable and deployable.** One image per service, own port, own container, own `node_modules`. Dockerfiles take the **repo root** as build context, because `event` and `booking` copy `shared/`, which sits outside their own folder:
 
 ```bash
 docker build -f services/booking/Dockerfile -t tm-booking .
 ```
 
-**`@tm/shared` is an npm workspace package, not a relative import.** `shared/availability.js` holds hold-key names and expiry semantics; Event Service reads those keys, Booking Service writes them, and two copies of the names would drift — drift here renders a held seat as available.
+`auth`, `search`, and `gateway` don't reference `shared/`, so their Dockerfiles don't copy it.
 
-The cost is a **lockstep deploy**: changing a key name in `shared/` requires deploying Event and Booking together, or the seat map shows held seats as free. Treat a change there like an `ALTER TABLE` — dual-write both names, deploy both, then drop the old. Keep `shared/` to constants and key builders; the moment business logic lands there, every service redeploys on every change.
+**`shared/` is plain relative imports, not an npm workspace.** `shared/package.json` has no `name`, and no service depends on it — every import is `../../../shared/<file>.js`. It exists so a writer and a reader agree on exact key names: Booking writes hold keys, Event Service reads them, and two copies of those names would drift silently.
 
-**Only the gateway publishes a port.** In compose, the other four are reachable only on the `internal` network. "Service ports are not public" is then a property of the deployment, not a promise in a doc.
+The cost is a **lockstep deploy**: changing a key name in `shared/` requires deploying every reader and writer together, or the seat map shows held seats as free. Treat it like an `ALTER TABLE` — dual-write both names, deploy both, then drop the old. Keep `shared/` to constants, key builders, and one shared read; the moment business logic lands there, every service redeploys on every change.
+
+**Only the gateway publishes a port.** In compose, nothing else has a `ports:` mapping, so the rest are reachable only on the `internal` network. "Service ports are not public" is a property of the deployment, not a promise in a doc — but it's a network assumption the code itself cannot enforce, since every service trusts the `X-User-Id` / `X-User-Role` headers the gateway injects.
 
 **Repositories never throw HTTP errors.** `hold.repository.js` returns a status string; `hold.service.js` maps it to `createApiError`. Keeps Redis and SQL out of the controller and status codes out of the data layer.
 
