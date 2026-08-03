@@ -1,19 +1,23 @@
 import "dotenv/config";
 import app from "./app.js";
+import pool, { connectDB } from "./config/db.js";
 
 const PORT = Number(process.env.PORT) || 3001;
 
 const startServer = async () => {
     try {
-        // Week 4 Day 2 adds `await connectDB()` here, plus `pool.end()` in the
-        // shutdown handler. Until then this service has no datastore to drain.
+        await connectDB();
+
         const server = app.listen(PORT, () => {
             console.log(`Auth service listening on port ${PORT}`);
         });
 
         const shutdown = (signal) => {
             console.log(`${signal} received, shutting down`);
-            server.close(() => process.exit(0));
+            server.close(async () => {
+                await pool.end();
+                process.exit(0);
+            });
         };
 
         process.on("SIGINT", () => shutdown("SIGINT"));

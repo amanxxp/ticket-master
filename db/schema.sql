@@ -11,6 +11,24 @@ CREATE TABLE users (
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Refresh tokens are opaque and revocable — the reason a stateless access JWT
+-- alone can't support logout. `token_hash` only: the raw token is bearer-secret
+-- equivalent to a password, but high-entropy and random rather than
+-- human-chosen, so a fast hash (sha256) is the right tool here, not a slow KDF —
+-- there is no low-entropy space for an attacker to dictionary-search.
+CREATE TABLE refresh_tokens (
+  id         BIGSERIAL PRIMARY KEY,
+  user_id    BIGINT NOT NULL REFERENCES users(id),
+  token_hash TEXT NOT NULL UNIQUE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Refresh and logout both look up "the active token for this hash" — serves
+-- that exact lookup instead of a full table scan.
+CREATE INDEX idx_refresh_tokens_active ON refresh_tokens (token_hash) WHERE revoked_at IS NULL;
+
 CREATE TABLE venues (
   id         BIGSERIAL PRIMARY KEY,
   name       TEXT NOT NULL,

@@ -1,10 +1,20 @@
 import "dotenv/config";
 import app from "./app.js";
+import { connectRedis, disconnectRedis } from "./config/redis.js";
 
 const PORT = Number(process.env.PORT) || 3000;
 
 const startServer = async () => {
     try {
+        // Best-effort, not a startup gate: Redis backs the rate limiter only.
+        // Blocking every route in the gateway — including ones nothing rate-limits
+        // — on the rate limiter's own datastore being reachable would be a far
+        // worse outage than the limiter failing open for a while (see
+        // middlewares/rateLimit.js).
+        connectRedis().catch((err) =>
+            console.error("Could not connect to Redis (rate limiter will fail open):", err.message)
+        );
+
         const server = app.listen(PORT, () => {
             console.log(`Gateway listening on port ${PORT}`);
         });
@@ -17,7 +27,10 @@ const startServer = async () => {
 
         const shutdown = (signal) => {
             console.log(`${signal} received, shutting down`);
-            server.close(() => process.exit(0));
+            server.close(async () => {
+                await disconnectRedis();
+                process.exit(0);
+            });
         };
 
         process.on("SIGINT", () => shutdown("SIGINT"));

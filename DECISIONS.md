@@ -744,6 +744,195 @@ not stretched to cover log lines nobody touched.
 
 ---
 
+## Week 4 Day 2 — Auth Service
+
+### 43. bcrypt over argon2, and why the cost factor is the whole point
+
+Both were installed at scaffolding time as candidates (`bcrypt` in
+`package.json`); bcrypt is used. Argon2id is the newer, generally-preferred
+answer (memory-hard, resists GPU/ASIC parallelization better) — the choice
+here is pragmatic, not a claim that bcrypt is superior. What actually matters
+for the acceptance criterion is not which algorithm but that it has a **tunable
+cost factor** at all: a fast hash (SHA-256, MD5) computes in microseconds no
+matter how it's configured, so an offline attacker with a leaked
+`password_hash` column can try billions of guesses a second. bcrypt's cost
+factor (12 here) is deliberately expensive **by design**, tunable upward as
+hardware gets faster — the property "slow KDF" names is this tunability, not
+brand loyalty to one algorithm.
+
+### 44. Timing-safe login: same message, same cost, on every failure path
+
+`login()` in `services/auth/services/auth.service.js` runs `bcrypt.compare`
+on *every* rejected login, including one where no user was found at all —
+against a `DUMMY_HASH` precomputed once at module load with the same cost
+factor real hashes use. Two things had to both be true for this to work:
+- **The dummy hash is precomputed at boot, not lazily on first miss.** A
+  lazily-computed hash would make the *first* wrong-email attempt visibly
+  slower than every subsequent one (paying the one-time bcrypt.hash cost
+  inline), which is itself a timing tell — just a one-shot one instead of a
+  per-request one.
+- **The error message is identical text** ("Invalid email or password") for
+  both "no such user" and "wrong password." Timing-safety without
+  message-safety is half a fix — an attacker doesn't need a stopwatch if the
+  response body already says which one happened.
+
+### 45. Refresh tokens are opaque and hashed — not because it's "more secure" in the abstract, but because it's the only thing that makes logout real
+
+A JWT is verified by recomputing its signature — nothing server-side ever
+"looks it up," so nothing server-side can flag one as revoked without a
+blacklist keyed by... something, which is a stateful side-channel to the
+supposedly stateless token anyway. Making the refresh token opaque (a random
+value, not a JWT) and storing its hash in Postgres sidesteps the contradiction
+entirely: revocation is `UPDATE ... SET revoked_at = now()`, checked on every
+use (`getActiveRefreshToken`'s `revoked_at IS NULL`). This is *why* two token
+types exist at all, not an arbitrary design flourish — the access token is
+fast and stateless for the common case (verified on every request without a
+DB round trip); the refresh token is the one point where "can this be revoked"
+actually needs to be true, so it's the one built to support it.
+
+Hashed with sha256, not bcrypt, unlike the password — see the schema comment
+on `refresh_tokens.token_hash` (#-numbered decision folded into
+`db/schema.sql` directly): a refresh token is 256 bits of `crypto.randomBytes`,
+never typed or reused, so there is no low-entropy guessable space a slow KDF
+would be defending against. A fast hash is correct here; using bcrypt would
+just be slow for no security benefit.
+
+### 46. No refresh-token rotation — a deliberate, smaller choice than the "better" one
+
+`/auth/refresh` returns only a new access token; the same refresh token
+remains valid until its own expiry or an explicit logout. Rotation (issuing a
+new refresh token on every use and revoking the old one) is the stronger
+practice — it bounds how long a stolen-but-unused refresh token stays useful
+once the legitimate client refreshes again — and was considered and left out
+here. Reason: REQUIREMENTS.md's acceptance criterion says only "`/auth/refresh`
+issues a new access token," and rotation changes the client contract (the
+caller must now persist a new refresh token from every refresh response, or
+their session silently breaks the next time they try to reuse the old one).
+Adding that silently, beyond what was asked, would be a bigger and riskier
+change than the task called for. Worth revisiting if refresh-token theft is a
+real threat model for this system — noted here rather than decided past what
+was requested.
+
+---
+
+## Week 4 Day 3 — Gateway authn + authz
+
+### 47. Why trusting `X-User-Id`/`X-User-Role` downstream is safe — and the one thing that has to be true for it to stay that way
+
+Booking Service's `requireUserId` (built in Week 1, before any of this
+existed) reads `x-user-id` off the request header and trusts it completely —
+by construction, nothing in that function can tell a gateway-verified id from
+one a client typed into curl by hand. That is only safe under one condition,
+and it is a **network topology** fact, not something this code can enforce
+itself: **the service must be unreachable except through the gateway.** In
+this system that is `docker-compose.yml`'s job — `auth`/`event`/`search`/
+`booking` publish no host port at all (verified structurally: only `gateway`
+has a `ports:` entry), so from outside the compose network there is no way to
+reach Booking Service directly and hand it a forged header. The gateway
+strips and overwrites `X-User-Id`/`X-User-Role` on every request
+(`routes/proxy.js`'s `on.proxyReq`) specifically so that even a client who
+*does* have network access to the gateway cannot make their own header value
+survive the hop — but that stripping only matters because the gateway is the
+sole entry point in the first place. If a future deployment ever exposed a
+service port directly (a debug port left open, a load balancer misconfigured
+to route around the gateway), this entire trust model breaks silently — the
+downstream service has no way to know it is being bypassed. This is the
+textbook confused-deputy shape: the service (deputy) acts on an identity claim
+it cannot itself verify, trusting that only an honest broker (the gateway)
+ever hands it one.
+
+### 48. `POST /events` with `role=user` is 403, not 401 — because the two questions are genuinely different
+
+401 answers "do I know who you are." 403 answers "given who you are, are you
+allowed to do this." A `role=user` caller presenting a perfectly valid,
+unexpired, correctly-signed JWT has fully answered the first question — the
+gateway *does* know who they are — and is refused only on the second. Folding
+both into 401 (a common shortcut) would make "your token is bad" and "your
+token is fine but you're not allowed" indistinguishable to the client, which
+is a worse API: one says "log in again," the other says "you cannot do this
+regardless of how you log in." `enforceAccess.js` encodes this directly —
+`policy.auth === 'required' && !req.user` is the 401 branch; `policy.roles`
+is checked only afterward, and only fails with 403.
+
+### 49. `GET /search`: public *and* rate-limited *and* "keyed on the injected userId" are in tension — resolved as optional auth
+
+REQUIREMENTS.md's own two rows are, read literally, incompatible for this one
+route: the routing table marks `/search` public (no auth required), while
+Day 4's rate-limiter criterion says the limiter must key on the **injected**
+userId, which by definition doesn't exist for an unauthenticated caller.
+Rather than silently pick one requirement over the other, `authenticate.js`
+always attempts to verify a Bearer token if one is present — succeeding or
+failing, it never itself rejects — and `policy.js` marks `/search` as
+`auth: 'optional'`: a present, valid token is used opportunistically
+(`enforceAccess.js` keys the limiter on `user:${req.user.id}`), while a
+missing or invalid one is simply treated as anonymous and keyed on
+`ip:${req.ip}` instead. This keeps the route genuinely public (nobody is
+required to authenticate to search) while still honoring per-user keying for
+every caller who happens to be logged in — which, for a client-side search
+box behind an already-authenticated app session, is the common case in
+practice. IP-keying is the honest fallback for the remaining anonymous
+sliver of traffic, not the default the requirement warns against (see #51).
+
+---
+
+## Week 4 Day 4 — Sliding-window rate limiter
+
+### 50. Sliding-window log (Redis ZSET), not fixed-window or a sliding-window counter
+
+Three algorithms were on the table, per the concept list:
+- **Fixed window** (e.g. a counter that resets every `:00` boundary) is
+  rejected explicitly by the acceptance criteria — it lets a client send N
+  requests in the last millisecond of one window and N more in the first
+  millisecond of the next, 2N requests in a blink, without ever technically
+  exceeding "N per window."
+- **Sliding-window counter** (a weighted average of the current and previous
+  fixed windows) fixes the boundary problem approximately, cheaply, in O(1)
+  space — but it's an *approximation*, and reasoning about "is the atomic
+  increment+check actually correct" is harder to argue for a formula than for
+  an exact structure.
+- **Sliding-window log** (every request timestamp is its own ZSET member,
+  purged by score before every count) is exact — at any instant, `ZCARD`
+  after the purge is the literal count of requests in the trailing
+  `windowMs`, no averaging, no boundary. Cost: O(requests-in-window) memory
+  per key instead of O(1), which is fine at this system's scale and is the
+  right trade for correctness this system's tests can actually verify against.
+
+Chosen for the same reason the booking-confirm guard chose an exact
+compare-and-swap over an approximation: at this scale, exactness costs little
+extra and is far easier to defend when the acceptance test asks "does the
+window actually slide."
+
+### 51. Keyed on the injected userId, not IP — why IP is the wrong default
+
+IP address identifies a network endpoint, not a person. Everyone behind one
+NAT — an office, a campus network, a mobile carrier's shared gateway — shares
+one IP, so an IP-keyed limit throttles all of them as a single caller; one
+heavy user exhausts the budget for everyone else on that connection. Keying
+on the gateway-verified `userId` instead means the limit tracks the actual
+caller, unaffected by how many other people happen to share their network
+path. IP-keying is used here only as the deliberate, narrower fallback for
+the one route (`/search`) that permits genuinely anonymous traffic — see
+#49 — never as the general-purpose key.
+
+### 52. `POST /webhooks/stripe` is exempt from both — because rate-limiting it would lose money, not just annoy a client
+
+Stripe's own retry behavior is the mechanism this would break: if the gateway
+ever 429s a webhook delivery, Stripe treats that as a failed delivery and
+retries on its own schedule, but a burst of legitimate events (a flash sale, a
+batch of confirmations landing together) is exactly the traffic pattern most
+likely to *look* like abuse to a naive per-caller rate limiter — except the
+"caller" here is Stripe's infrastructure, not an attacker, and every one of
+those events represents money that has already moved. Rejecting one is not
+"the client can just retry the search box" — it's "a payment confirmation
+did not reach the system that needs to know about it," which can mean a
+customer paid and never got their booking, or a refund event never
+processed. The webhook's own security is Stripe's signature over the payload,
+verified inside Booking Service — a concern entirely orthogonal to whether
+the *caller* is who a JWT would say it is, which is what the gateway's
+auth layer checks and this endpoint has no JWT to check in the first place.
+
+---
+
 ## Still open
 
 - **Why holds are in Redis and bookings are in Postgres** — argued in (4) and (7);

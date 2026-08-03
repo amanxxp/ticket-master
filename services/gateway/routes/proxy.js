@@ -2,6 +2,9 @@ import { createProxyMiddleware } from "http-proxy-middleware";
 import { CORRELATION_ID_HEADER } from "../../../shared/correlationId.js";
 import { codeForStatus } from "../../../shared/httpError.js";
 
+const USER_ID_HEADER = "X-User-Id";
+const USER_ROLE_HEADER = "X-User-Role";
+
 const DEFAULT_PROXY_TIMEOUT_MS = 10000;
 
 // Exact-segment prefix match — `pathname.indexOf(prefix) === 0` (the library's
@@ -30,6 +33,21 @@ export const createUpstreamProxy = ({ name, target, pathFilter, proxyTimeoutMs =
         on: {
             proxyReq: (proxyReq, req) => {
                 proxyReq.setHeader(CORRELATION_ID_HEADER, req.correlationId);
+
+                // Overwrite, not merge: httpxy copies the client's original
+                // request headers onto the outgoing one before this hook runs,
+                // so whatever a caller sent as X-User-Id/X-User-Role is already
+                // present here and MUST be replaced (authenticated) or removed
+                // (anonymous) — never left as the client's own value. A forged
+                // header surviving even transiently is exactly the confused-
+                // deputy hole this exists to close.
+                if (req.user) {
+                    proxyReq.setHeader(USER_ID_HEADER, String(req.user.id));
+                    proxyReq.setHeader(USER_ROLE_HEADER, req.user.role);
+                } else {
+                    proxyReq.removeHeader(USER_ID_HEADER);
+                    proxyReq.removeHeader(USER_ROLE_HEADER);
+                }
             },
             // Supplying this disables http-proxy-middleware's own default error
             // plugin entirely (get-plugins.js skips it whenever `options.on.error`
