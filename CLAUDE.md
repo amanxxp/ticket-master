@@ -30,8 +30,15 @@ re-litigate:
 | What's built vs not? | `git log` + `DECISIONS.md`'s highest entry number |
 | Where in the schedule? | `TIMELINE.md`'s "You are here" — hand-maintained, verify against `git log` |
 
-**No automated test suite exists** (see Commands). That is a known state, not
-something to fix on sight.
+**There is no unit-test suite**, but there ARE seven end-to-end acceptance
+scripts under `scripts/` — one per build day, each asserting that day's criteria
+and exiting non-zero on failure. Run the relevant one after touching a component;
+`TIMELINE.md` lists which script covers which day.
+
+**Weeks 5 Day 3 → 6 Day 4 were written by an assistant, not cold-built.** The
+retest ledger in `TIMELINE.md` has an Author column. Those components pass their
+acceptance tests but have never been rebuilt from memory, so the project's own
+"not learned until cold-passed twice" rule has not been satisfied for them.
 
 `README.md` is written for a human arriving at the repo; this file is written
 for an agent working in it. Where they overlap, this file is the one kept
@@ -64,14 +71,11 @@ When they say "test at the end" or skip verification, note what is therefore
 
 ## Commands
 
-There is no root build/test/lint command — each service is independently run
-and has no wired test script (`"test": "echo ... && exit 1"` in every
-`package.json`). **No automated test suite is committed to this repo at all.**
-Verification during development has been done with throwaway `node:test`
-files run directly (`node --experimental-test-module-mocks --test <file>`)
-against mocked Postgres/Redis/ES — none of that is checked in. If you add
-real tests, decide where they should live; there's no existing convention to
-follow.
+There is no root build/test/lint command and no unit-test runner — every
+service's `package.json` still has the placeholder `"test": "echo ... && exit 1"`.
+Verification is the end-to-end acceptance scripts under `scripts/`, listed below.
+They hit a real Postgres, a real Redis, and a fake-but-file-backed Stripe; there
+are no mocks and nothing is checked in that runs without those services up.
 
 ```bash
 # Datastores (Postgres, Redis, Elasticsearch) — no `docker compose` (space)
@@ -95,7 +99,28 @@ npm run hammer -- --url http://localhost:3004/bookings/confirm --method POST \
 # Booking-confirm concurrency acceptance script (50-concurrent, overlapping
 # sets, opposite lock order, guard-removal — see the script's own comments):
 node scripts/booking-concurrency-test.js
+
+# Per-day acceptance scripts. Each exits non-zero on failure.
+node scripts/fairness-test.js --n 1000     # W5 D3 — draw correlation + monotonicity
+node scripts/cancel-waitlist-test.js       # W5 D4 — cancel, waitlist, SSE publish
+node scripts/queue-load-test.js --n 10000  # W5 D5 — load, over-admission, pool budget
+node scripts/payment-test.js               # W6 D1 — server amount, idempotency, refund
+node scripts/webhook-test.js               # W6 D2 — signature, replay, out-of-order
+node scripts/failure-injection.js          # W6 D3+D4 — 8 injections + reconciler
+
+# The reconciler, one sweep, prints its metrics and exits:
+cd services/reconciler && npm run once
 ```
+
+Booking, and anything importing its Stripe config, needs **`STRIPE_MODE=fake`**
+unless a real `sk_test_` key is set — the config throws at boot rather than
+silently pretending payments succeeded. The fake is file-backed
+(`/tmp/tm-fake-stripe.json`) specifically so the reconciler, a separate process,
+can see charges the booking service made.
+
+`failure-injection.js` starts and stops its own booking processes on ports
+3104/3105 and stops/starts the Redis and Elasticsearch **containers**. Do not run
+it while you care about what is running.
 
 Each service is run individually — there is no root `dev`/`start` that boots
 everything at once:
@@ -104,6 +129,7 @@ everything at once:
 cd services/<name> && npm run dev     # node --watch server.js (auth/event/gateway/search/booking)
 cd services/admitter && npm start     # node admitter.js — worker, no --watch script
 cd services/outbox-poller && npm start
+cd services/reconciler && npm start   # loop; `npm run once` for a single sweep
 ```
 
 Full stack via Compose (`--profile full` is required — the default `up`
@@ -138,7 +164,8 @@ ticket-master-server/
     ├── search/        :3003
     ├── booking/       :3004
     ├── admitter/             # worker, no inbound port
-    └── outbox-poller/        # worker, no inbound port
+    ├── outbox-poller/        # worker, no inbound port
+    └── reconciler/           # worker, no inbound port — pending-payment sweeper + drift detector
 ```
 
 `shared/` file-by-file responsibilities are in the section below — read that
@@ -176,7 +203,9 @@ Import `app.js` if you need the app without a live listener.
 | `search` | No `repositories/`. `services/search.service.js` queries Elasticsearch through `config/elasticsearch.js` directly. |
 | `event` | Extra `sse/` dir (`registry.js` = live connections, `subscriber.js` = Redis pub/sub consumer). |
 | `booking` | Extra `middlewares/requireAdmission.js` — verifies the admission JWT before the route body runs. |
-| `admitter`, `outbox-poller` | Workers: entry is `admitter.js` / `poller.js`, no `app.js`, no `routes/`, no `controllers/`. They keep `config/`, `repositories/`, `services/`. |
+| `admitter`, `outbox-poller`, `reconciler` | Workers: entry is `admitter.js` / `poller.js` / `reconciler.js`, no `app.js`, no `routes/`, no `controllers/`. They keep `config/`, `repositories/`, `services/`. |
+| `booking` | Also mounts `/webhooks` with `express.raw` **before** the global `express.json` (app.js). Reordering that breaks Stripe signature verification irrecoverably — the signed bytes are gone once parsed. |
+| `reconciler` | Unlike the admitter it takes **no leader lease** — every claim is `FOR UPDATE SKIP LOCKED`, so instances take disjoint rows and there is no shared budget to overspend. |
 
 **Two validation styles coexist** — know which one you're in before adding a
 route. `auth` and `event` wire `middlewares/validate.js` at the route level;

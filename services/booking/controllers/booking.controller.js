@@ -6,14 +6,14 @@ import { createApiError } from "../utils/apiError.js";
 
 export const confirmBooking = async (req, res) => {
     const userId = requireUserId(req);
-    const { eventId, ticketIds } = validateConfirmBooking(req.body);
+    const { eventId, ticketIds, paymentMethodId } = validateConfirmBooking(req.body);
     // Admission is required on confirm too, not just reserve — per the
     // routing table, both are gated the same way. A reserved hold does not
     // itself carry admission forward; the admission token must still be
     // presented (and still be unexpired) on the confirm call too.
     requireAdmission(req, userId, eventId);
 
-    const booking = await bookingService.confirmBooking({ userId, eventId, ticketIds, correlationId: req.correlationId });
+    const booking = await bookingService.confirmBooking({ userId, eventId, ticketIds, paymentMethodId, correlationId: req.correlationId });
     return responseHandler(booking, res, "Booking confirmed", 201);
 }
 

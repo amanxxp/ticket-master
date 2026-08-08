@@ -18,6 +18,7 @@
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const { Client } = require('pg');
+const jwt = require('jsonwebtoken');
 
 const BOOKING_DIR = path.join(__dirname, '..', 'services', 'booking');
 const PORT = Number(process.env.TEST_PORT) || 3999;
@@ -110,12 +111,35 @@ async function seed(client, { tickets, label }) {
 
 // ---------------------------------------------------------------- firing
 
+const ADMISSION_SECRET = process.env.ADMISSION_TOKEN_SECRET || 'changeme';
+function admissionFor(userId, eventId) {
+  return jwt.sign({ eventId: String(eventId) }, ADMISSION_SECRET, {
+    subject: String(userId),
+    expiresIn: 900,
+  });
+}
+
 async function confirm(userId, eventId, ticketIds) {
   try {
     const res = await fetch(`${BASE}/bookings/confirm`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-user-id': String(userId) },
-      body: JSON.stringify({ eventId: String(eventId), ticketIds: ticketIds.map(String) }),
+      headers: {
+        'Content-Type': 'application/json',
+        'x-user-id': String(userId),
+        // The admission gate (Week 5 Day 2) rejects confirm with 403 before any
+        // store access. Signed with the same secret the service verifies with, so
+        // this is a real admission, not a bypass — the gate is still doing its job,
+        // this test just isn't exercising the queue that normally issues the token.
+        'x-admission-token': admissionFor(userId, eventId),
+      },
+      // paymentMethodId became mandatory on confirm in Week 6 Day 1 — a confirm
+      // without one is a free ticket, so the validator rejects it with 422. This
+      // test predates that change; `pm_test_visa` succeeds under STRIPE_MODE=fake.
+      body: JSON.stringify({
+        eventId: String(eventId),
+        ticketIds: ticketIds.map(String),
+        paymentMethodId: 'pm_test_visa',
+      }),
     });
     await res.text().catch(() => {});
     return String(res.status);

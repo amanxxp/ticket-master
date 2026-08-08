@@ -136,10 +136,105 @@ export const countUserTicketsForEvent = async (userId, eventId) => {
 
 export const getEvent = async (eventId) => {
     const { rows } = await pool.query(
-        `SELECT id, max_tickets_per_user AS "maxTicketsPerUser"
+        `SELECT id,
+                max_tickets_per_user AS "maxTicketsPerUser",
+                queue_mode           AS "queueMode",
+                sale_opens_at        AS "saleOpensAt",
+                draw_seed            AS "drawSeed"
          FROM events
          WHERE id = $1 AND NOT is_deleted`,
         [eventId]
+    );
+    return rows[0] ?? null;
+};
+
+// Publishes the lottery seed exactly once, and only once sale_opens_at has
+// passed. Both halves matter:
+//
+// `draw_seed IS NULL` makes this a compare-and-swap — concurrent first requests
+// after sale-open race here, one wins, and every loser reads the winner's seed
+// back out of the returned row. A read-then-write would let two callers generate
+// two seeds and score the same user twice, differently.
+//
+// `now() >= sale_opens_at` is evaluated by Postgres, not by the caller, so the
+// seed cannot be coaxed into existing early by a client (or a service) with a
+// fast clock. Before that moment the seed does not exist anywhere to be leaked,
+// which is the entire basis of "unguessable pre-open" — not the strength of the
+// hash, but the absence of its input.
+export const claimDrawSeed = async (eventId, seed) => {
+    const { rows } = await pool.query(
+        `UPDATE events
+            SET draw_seed = $2
+          WHERE id = $1
+            AND draw_seed IS NULL
+            AND sale_opens_at IS NOT NULL
+            AND now() >= sale_opens_at
+        RETURNING draw_seed AS "drawSeed"`,
+        [eventId, seed]
+    );
+    return rows[0]?.drawSeed ?? null;
+};
+
+// ---------------------------------------------------------------- cancellation
+
+// Locks the booking row before anything reads its status. Without the lock two
+// concurrent cancels both read 'confirmed', both proceed, and the seat is
+// released twice — the second release re-opening a seat somebody else has since
+// bought. Same shape as the confirm path's row lock, for the same reason.
+export const lockBookingForCancel = async (client, bookingId) => {
+    const { rows } = await client.query(
+        `SELECT id, user_id AS "userId", event_id AS "eventId", status,
+                total_amount AS "totalAmount"
+         FROM bookings
+         WHERE id = $1
+         FOR UPDATE`,
+        [bookingId]
+    );
+    return rows[0] ?? null;
+};
+
+export const getBookedTicketIds = async (client, bookingId) => {
+    const { rows } = await client.query(
+        `SELECT ticket_id AS "ticketId"
+         FROM booking_items
+         WHERE booking_id = $1
+         ORDER BY ticket_id`,
+        [bookingId]
+    );
+    return rows.map((r) => r.ticketId);
+};
+
+// The rows are DELETEd, not flagged. `UNIQUE (ticket_id)` on booking_items means
+// a surviving row would block the seat from ever being sold again — the resale
+// path is the reason, exactly as argued in DECISIONS.md #5. The audit trail is
+// not lost: `bookings` keeps the cancelled row with its total, and the outbox
+// keeps the event.
+export const releaseBookedTickets = async (client, bookingId, ticketIds) => {
+    await client.query(`DELETE FROM booking_items WHERE booking_id = $1`, [bookingId]);
+
+    // `status = 'booked'` in the WHERE is a guard, not decoration: if a ticket is
+    // somehow already 'available', this returns fewer rows than asked and the
+    // caller can tell rather than silently double-releasing.
+    const { rows } = await client.query(
+        `UPDATE tickets
+            SET status = 'available'
+          WHERE id = ANY($1::bigint[]) AND status = 'booked'
+        RETURNING id`,
+        [ticketIds]
+    );
+    return rows.map((r) => r.id);
+};
+
+// Guarded on the current status so the transition can only happen once even if
+// the row lock above were removed — the same belt-and-braces habit as the confirm
+// path's three layers.
+export const markBookingStatus = async (client, bookingId, nextStatus, fromStatuses) => {
+    const { rows } = await client.query(
+        `UPDATE bookings
+            SET status = $2
+          WHERE id = $1 AND status = ANY($3::text[])
+        RETURNING id, status`,
+        [bookingId, nextStatus, fromStatuses]
     );
     return rows[0] ?? null;
 };

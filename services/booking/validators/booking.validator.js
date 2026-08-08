@@ -54,7 +54,17 @@ const validateTicketSelection = (body) => {
     return { eventId, ticketIds };
 };
 
-export const validateConfirmBooking = validateTicketSelection;
+// Confirm additionally carries the payment method. `amount`/`price` stay on the
+// forbidden list in validateTicketSelection — the client names HOW to charge,
+// never HOW MUCH.
+export const validateConfirmBooking = (body) => {
+    const selection = validateTicketSelection(body);
+    const { paymentMethodId } = body;
+    if (typeof paymentMethodId !== "string" || paymentMethodId.length === 0 || paymentMethodId.length > 255) {
+        throw createApiError("paymentMethodId must be a non-empty string", 422);
+    }
+    return { ...selection, paymentMethodId };
+};
 
 // `expiresAt` is added to the forbidden list by the same rule as `price`: the
 // hold's lifetime is server-set, and a client that could name it could set it to

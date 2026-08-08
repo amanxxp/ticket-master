@@ -215,6 +215,26 @@ services:
       postgres: { condition: service_healthy }
       elasticsearch: { condition: service_started }
 
+  # Worker, not an HTTP service. Sweeps stranded 'pending' payments against the
+  # provider, expires lapsed waitlist claims, and clears Redis/Postgres hold drift.
+  # Deliberately has NO leader lease — every claim it makes is FOR UPDATE SKIP
+  # LOCKED, so `--scale reconciler=2` takes disjoint rows rather than racing.
+  reconciler:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/reconciler/Dockerfile
+    environment:
+      <<: *postgres-env
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      STRIPE_MODE: fake
+      RECONCILE_PENDING_AFTER_SECONDS: 120
+      RECONCILER_TICK_MS: 30000
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
 networks:
   internal:
 

@@ -1,0 +1,17 @@
+{
+  "name": "reconciler",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "reconciler.js",
+  "scripts": {
+    "start": "node reconciler.js",
+    "once": "node reconciler.js --once"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "pg": "^8.22.0",
+    "redis": "^6.1.0",
+    "stripe": "^17.4.0"
+  }
+}

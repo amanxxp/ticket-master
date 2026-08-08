@@ -11,9 +11,29 @@
 
 ## ▶ You are here
 
-**Week 5, Day 3 — fairness: registration window + randomized draw.**
+**Week 6 complete as code. Nothing in Weeks 5 Day 3 → 6 Day 4 has been built cold.**
 
-Done through Week 5 Day 2. `DECISIONS.md` runs to **#61**; its highest entry number is the reliable progress signal, not this marker.
+Weeks 1–5 Day 2 are yours. **Week 5 Day 3 onward was written by an assistant on
+request** — see the "Author" column in the retest ledger. Those components pass
+their acceptance criteria but have never been built from memory, so by this
+document's own rule they are not learned. Treat their ledger rows as first
+builds, not rebuilds.
+
+Two days cannot be done for you and remain genuinely open:
+
+- ☐ **Week 6 Day 3 predictions** — `PREDICTIONS.md` is a blank template. The
+  harness (`scripts/failure-injection.js`) runs the eight injections; the value
+  is the gap between what you predicted and what happened. Fill it in *before*
+  running it.
+- ☐ **Week 6 Day 5 walkthrough** — recorded, unscripted, no notes, six points.
+  That is the exam.
+
+Also still open: outreach logs, and `scripts/redis-counter.js` (Week 2 Day 2's
+round-trip criterion was never asserted with an instrumented counter).
+
+---
+
+## What is built
 
 | Week | Built |
 |---|---|
@@ -21,18 +41,36 @@ Done through Week 5 Day 2. `DECISIONS.md` runs to **#61**; its highest entry num
 | 2 | Redis holds + cap, seat map, SSE fan-out via Redis pub/sub |
 | 3 | Keyset + offset pagination, event cache, Elasticsearch, outbox CDC poller |
 | 4 | Gateway proxy + policy table, auth (JWT + refresh), authz, sliding-window rate limiter, correlation IDs |
-| 5 | Day 1 queue join + position · Day 2 admitter worker, leader lease, admission token |
+| 5 | Queue join + position, admitter + leader lease, lottery draw, cancel + waitlist, load test |
+| 6 | Day 1 payment + refund · Day 2 webhook · Day 3 injection harness · Day 4 reconciler |
 
-**Day 3:** `score = hash(userId, eventSeed)`, seed generated at sale-open. Position must be uncorrelated with join time — prove it with a correlation check over 1000 sequential registrants, not by eye. Seed unguessable before open. Keep FIFO behind a flag for comparison.
+## Acceptance scripts
 
-Then Day 4 (cancel + waitlist) and Day 5 (10k-join load test) close Week 5.
+Each of these asserts its day's criteria and exits non-zero on failure:
 
-Still open from earlier weeks, carried deliberately:
-- ☐ `scripts/redis-counter.js` — Week 2 Day 2's round-trip criterion was never asserted with an instrumented counter
-- ☐ no automated test suite is committed; verification has been throwaway scripts
-- ☐ cold rebuilds (W1 D4, W2 D4) — check the retest ledger below before claiming a component learned
+```
+node scripts/booking-concurrency-test.js   # W1 D2 — 3-layer double-book guard
+node scripts/fairness-test.js --n 1000     # W5 D3 — correlation + monotonicity
+node scripts/cancel-waitlist-test.js       # W5 D4 — cancel, waitlist, SSE
+node scripts/queue-load-test.js --n 10000  # W5 D5 — load, over-admission, pool
+node scripts/payment-test.js               # W6 D1 — amount, idempotency, refund
+node scripts/webhook-test.js               # W6 D2 — signature, replay, ordering
+node scripts/failure-injection.js          # W6 D3 + D4 — 8 injections, reconciler
+cd services/reconciler && npm run once     # W6 D4 — one sweep, prints metrics
+```
 
-Move this marker down as you finish each day.
+Most need Postgres + Redis up, the booking service running, and
+`STRIPE_MODE=fake`. `failure-injection.js` starts and stops its own processes on
+ports 3104/3105 and stops/starts the Redis and Elasticsearch containers.
+
+**Stop the admitter before running `fairness-test.js`.** It measures queue order,
+and an admitter legitimately drains the head of the queue mid-measurement, which
+shifts every position behind it. The script detects a held leader lease and
+refuses to run rather than producing a meaningless number.
+
+**Run `queue-load-test.js` WITH two admitters** (`cd services/admitter && npm
+start`, twice) — that is the only way its over-admission bound is tested rather
+than held trivially. The script says so when it sees zero admissions.
 
 ---
 
@@ -161,29 +199,36 @@ Only if Weeks 1–6 all cold-passed twice.
 
 ## Retest ledger (tick as you go)
 
-| Component | Built | Retest 1 | Retest 2 |
-|-----------|-------|----------|----------|
-| CRUD + validation + error shape | ☐ | | |
-| Booking confirm guard (3-layer) | ☐ | ☐ W1D4 | ☐ W2 |
-| Redis hold (atomic, TTL, cap, idempotent) | ☐ | ☐ W2D4 | ☐ W3 |
-| Seat-map read (constant round trips) | ☐ | ☐ W2D4 | |
-| SSE + pub/sub fan-out | ☐ | | |
-| Keyset pagination | ☐ | | |
-| Event cache + invalidation | ☐ | | |
-| Elasticsearch index + query | ☐ | | |
-| Outbox + CDC poller | ☐ | ☐ W4 | |
-| Gateway routing + correlation IDs | ☐ | | |
-| Auth: register/login | ☐ | | |
-| JWT verify / authz / refresh / logout | ☐ | | |
-| Rate limiter (sliding window) | ☐ | ☐ W5 | |
-| Queue join + position | ☐ | | |
-| Admitter / admission control | ☐ | | |
-| Fairness draw | ☐ | | |
-| Cancellation + waitlist | ☐ | | |
-| Payment idempotency + server-side amount | ☐ | | |
-| Webhook handling | ☐ | | |
-| Reconciler | ☐ | | |
+| Component | Author | Built | Retest 1 | Retest 2 |
+|-----------|--------|-------|----------|----------|
+| CRUD + validation + error shape | you | ✅ | ☐ | |
+| Booking confirm guard (3-layer) | you | ✅ | ☐ | ☐ |
+| Redis hold (atomic, TTL, cap, idempotent) | you | ✅ | ☐ | ☐ |
+| Seat-map read (constant round trips) | you | ✅ | ☐ | |
+| SSE + pub/sub fan-out | you | ✅ | ☐ | |
+| Keyset pagination | you | ✅ | ☐ | |
+| Event cache + invalidation | you | ✅ | ☐ | |
+| Elasticsearch index + query | you | ✅ | ☐ | |
+| Outbox + CDC poller | you | ✅ | ☐ | |
+| Gateway routing + correlation IDs | you | ✅ | ☐ | |
+| Auth: register/login | you | ✅ | ☐ | |
+| JWT verify / authz / refresh / logout | you | ✅ | ☐ | |
+| Rate limiter (sliding window) | you | ✅ | ☐ | |
+| Queue join + position | you | ✅ | ☐ | |
+| Admitter / admission control | you | ✅ | ☐ | |
+| Fairness draw (lottery + seed) | **assistant** | ✅ | ☐ **needs a first cold build** | ☐ |
+| Cancellation + waitlist | **assistant** | ✅ | ☐ **needs a first cold build** | ☐ |
+| Payment + refund (Stripe) | **assistant** | ✅ | ☐ **needs a first cold build** | ☐ |
+| Webhook handling | **assistant** | ✅ | ☐ **needs a first cold build** | ☐ |
+| Reconciler | **assistant** | ✅ | ☐ **needs a first cold build** | ☐ |
 
 **Rule:** component not cold-passed twice, spaced ≥3 days = not learned. Reschedule it into the next Day-5 slot.
 
-**Single-pass going into Week 6:** SSE fan-out, Elasticsearch, gateway, auth, authz, all of Week 5. Not learned, by the rule above. Cost of 6 weeks instead of 8. Free slot → spend it on SSE fan-out and the admitter.
+**Single-pass:** SSE fan-out, Elasticsearch, gateway, auth, authz, queue, admitter. Not learned, by the rule above.
+
+**Zero-pass:** the five assistant-written rows. They have acceptance tests that
+pass, which is not the same thing as being able to defend them from memory. If
+you rebuild anything, rebuild these — and the two with the subtlest failure modes
+are the **reconciler** (it is the only thing that recovers a crash between charge
+and confirm) and the **fairness draw** (its Lua `%.0f` score formatting is
+load-bearing in a way that is invisible until scores silently collide).

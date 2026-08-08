@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { confirmBooking, getBooking } from "../controllers/booking.controller.js";
 import { reserveTickets, releaseTickets, listHolds } from "../controllers/hold.controller.js";
+import { cancelBooking } from "../controllers/waitlist.controller.js";
 
 const router = Router();
 
@@ -11,6 +12,7 @@ router.delete('/reserve/:id', releaseTickets);
 router.get('/holds/:eventId', listHolds);
 
 router.post('/confirm', confirmBooking);
+router.post('/:id/cancel', cancelBooking);
 router.get('/:id', getBooking);
 
 export default router;

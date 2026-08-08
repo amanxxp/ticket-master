@@ -1071,3 +1071,181 @@ opinions about beyond making it one line to change.
 - **On cancel, does the `booking_items` row get deleted or does the unique
   constraint move?** — leaning delete, per the reasoning in (5); confirm when the
   cancel path is built (Week 5).
+
+---
+
+## Week 5 Day 3 → Week 6 Day 4 — written by an assistant, not cold-built
+
+Everything from here on was produced on explicit request rather than built from
+memory under a timer. The reasoning below is real and the acceptance tests pass,
+but none of it has been defended cold. `TIMELINE.md`'s retest ledger marks these
+rows accordingly.
+
+### 62. The lottery seed's unguessability comes from its ABSENCE, not from the hash
+
+`draw_seed` is 32 bytes of CSPRNG output, written by a conditional
+`UPDATE ... WHERE draw_seed IS NULL AND now() >= sale_opens_at`.
+
+Two properties, and the second is the one that matters. The `IS NULL` clause makes
+seed creation a compare-and-swap, so concurrent first-requests-after-open cannot
+mint two seeds and score the same user twice. The `now() >= sale_opens_at` clause
+is evaluated **by Postgres**, so a service with a fast clock cannot coax the seed
+into existing early.
+
+The actual security claim is not "SHA-1 is hard to invert." It is that before
+sale-open the seed does not exist anywhere, in any process, so there is nothing to
+precompute against. Choosing a stronger hash would not improve this; leaking the
+seed early would destroy it regardless of the hash.
+
+It lives in Postgres rather than Redis specifically so a `FLUSHALL` cannot
+re-seed a draw that has already been shown to users. Re-seeding would move
+positions upward, which is the one thing the queue promises never happens.
+
+### 63. Lua's `%.14g` silently collapsed ZSET scores — `%.0f` is load-bearing
+
+`redis.call` stringifies every argument, and Lua 5.1 stringifies numbers with
+`%.14g`. A 52-bit score therefore reached ZADD as `"4.5035996273705e+15"`, and
+distinct users rounded onto one score — the tail of the distribution collapsing
+into a lexicographic tiebreak rather than the intended uniform draw.
+
+Found by the acceptance test, not by reading the code: late joiners were landing
+at rank 4 instead of behind 1000 registrants. Both `drawScore` and the late-join
+score now go through `string.format('%.0f', n)`, which emits every integer digit.
+
+This is the kind of bug that has no error message. Nothing throws, the ZSET
+accepts the value, and the draw simply stops being fair.
+
+### 64. Late joiners are appended, not scored — monotonicity beats fairness here
+
+A user arriving after the draw is placed behind every drawn member, at
+`2^52 + INCR`, rather than being hash-scored into the existing distribution.
+
+This is a genuine conflict between two properties the queue claims, and it is
+resolved deliberately. Hash-scoring a latecomer would sometimes place them
+mid-queue, and inserting into a ZSET shifts the rank of everyone behind that slot
+**up by one** — users who have already been shown their position, moved backwards
+by somebody else's arrival. Appending cannot move anyone.
+
+The cost is that arrival time determines order among latecomers. Accepted: the
+draw exists to be fair to everyone who entered the registration window, not to
+reward arriving after it closed.
+
+### 65. Cancellation DELETEs `booking_items` — resale is the reason
+
+Closes the item left open at (5). `UNIQUE (ticket_id)` means a surviving row would
+block the seat from ever being sold again, so the row is deleted rather than
+flagged. The audit trail is not lost: `bookings` keeps the cancelled row with its
+total, and the outbox keeps the event.
+
+`cancelled` and `refunded` are kept as two distinct terminal states rather than
+one, because "we never charged you" and "we charged you and gave it back" are
+different facts, and a reconciler must distinguish them without joining to
+`payments`.
+
+### 66. The charge is a three-transaction saga, and the ordering is the point
+
+`recordPaymentIntent` (committed) → `executeCharge` (no transaction) →
+`settlePayment` (new transaction).
+
+The obvious shape — one transaction around all three — is wrong in a way that only
+appears on a crash: if the process dies after Stripe succeeds but before COMMIT,
+the rollback takes the `payments` row with it, and money that moved has nothing in
+the database pointing at it. Nothing to sweep, nothing to reconcile, discoverable
+only by reading Stripe's dashboard by hand.
+
+Committing the intent first is what makes a crash anywhere afterwards leave a
+`pending` row the reconciler can resolve. The cost is a real intermediate state —
+tickets `booked` under a `pending` booking — which is precisely why the reconciler
+is mandatory rather than a nicety.
+
+The refund path deliberately runs the **opposite** way, inside the transaction: a
+charge's risk is money moving with no record, a refund's risk is a record with no
+money moving, so a refund belongs where a provider failure can still undo the
+record.
+
+### 67. `disableOfflineQueue` — found by the drill, and it was an availability bug
+
+node-redis **queues commands while disconnected by default** and replays them on
+reconnect. That turns "Redis is down" into "every request touching Redis hangs
+forever": the command never rejects, the handler never returns, the HTTP request
+never completes. Enough of those and the service is unreachable even on routes
+that never touch Redis — a cache outage becomes a total outage.
+
+Discovered because the Week 6 Day 3 harness itself froze on scenario 4. The
+harness had no fetch timeout, so the tool looking for the hang hung too; both are
+fixed.
+
+With the offline queue disabled, reserve fails fast with a clean 5xx and confirm —
+which needs only Postgres — keeps working. That is what invariant 2 actually
+requires: fail fast, not queue quietly.
+
+### 68. The webhook replay ledger is claimed inside the state-change transaction
+
+`webhook_events` has `UNIQUE (provider, event_id)`, and the insert happens in the
+same transaction as the state change it authorises. A duplicate delivery raises
+23505 and aborts the whole transaction before touching anything.
+
+Recording the delivery *after* processing would leave a window in which a retry
+arriving mid-processing runs the handler a second time. Making it the first write
+in the same transaction is what turns "same event twice → one state change" into a
+database guarantee rather than a handler convention.
+
+Out-of-order delivery is handled by the same mechanism that makes the sync and
+webhook paths idempotent: every transition is guarded on its allowed source states,
+so a late `succeeded` arriving after a `refunded` matches nothing and changes
+nothing.
+
+Every 2xx tells Stripe to stop retrying, so unroutable and unknown event types are
+acked (200) rather than 400'd — a 400 would make Stripe retry a valid event
+forever. A bad signature is the exception: 400, because retrying will not fix it
+and acking a forged request is indistinguishable from accepting it.
+
+### 69. The reconciler needs no leader lease — unlike the admitter
+
+Every claim it makes uses `FOR UPDATE SKIP LOCKED`, so two instances take disjoint
+rows. There is no shared budget to overspend the way admission has, which is the
+only reason the admitter needs fencing. Safe to run concurrently and safe to run
+twice, because every write is a guarded state transition.
+
+Drift detection clears one direction only: held in Redis **and** booked in
+Postgres. The reverse (held in Redis, available in Postgres) is what a hold *is*,
+not drift, and is deliberately not counted. Clearing is safe because Postgres is
+the arbiter — removing a stale hold key cannot hand a booked seat to a second
+buyer.
+
+`driftFound` is emitted as a metric on every sweep, including zero, because "the
+sweep ran and found nothing" and "the sweep did not run" must be distinguishable
+from outside, and silence cannot express the difference.
+
+### 70. The fake Stripe is file-backed, because the reconciler is a different process
+
+An in-memory double cannot answer the only question the reconciler asks: "did some
+*other* process, now dead, charge this booking?" It would report no charge — the
+exact wrong answer — and the most important test in the suite would pass
+vacuously. A file is the smallest thing that gives the fake the property that
+matters: provider records outliving the process that created them.
+
+Deliberately not Redis: the failure drill stops Redis, and a provider that
+vanishes with your cache is not a useful stand-in for Stripe.
+
+Signature verification is the one thing the fake never reimplements — it runs the
+real library, offline, in both modes. An unverified webhook endpoint is a
+free-tickets endpoint, and a hand-rolled HMAC compare would be reimplementing
+exactly the code most worth testing.
+
+### 71. `Number(env) || fallback` treats an explicit 0 as unset — a real bug the drill found
+
+`Number(process.env.RECONCILE_PENDING_AFTER_SECONDS) || 120` looks harmless and is
+not. `Number("0")` is `0`, which is falsy, so setting the threshold to zero —
+"sweep everything now", which the failure drill depends on — silently produced 120
+instead. The sweep then found nothing, and the harness reported it as the
+reconciler failing to recover a stranded payment: a config bug wearing the costume
+of a correctness bug.
+
+Replaced by `utils/env.js`'s `numberFromEnv`, which distinguishes unset (`undefined`
+or `""`) from zero by checking the string before converting, and throws on
+non-numeric input rather than letting `NaN` reach a query.
+
+The pattern is everywhere in this codebase and is fine wherever zero is
+meaningless (a TTL of 0, a port of 0). It is only wrong where zero is a legitimate
+setting. Worth grepping for before trusting any `|| default` on a numeric knob.

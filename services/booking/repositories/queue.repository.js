@@ -6,7 +6,10 @@ import {
     departuresKey,
     admittedKey,
     soldOutKey,
+    registrantsKey,
+    drawDoneKey,
     ACTIVE_QUEUES_KEY,
+    DRAW_SCORE_LUA,
 } from "../../../shared/queue.js";
 
 // Atomic join-or-return-existing in one round trip: ZSCORE-then-ZADD as two
@@ -45,6 +48,138 @@ export const joinQueue = async (eventId, userId) => {
         arguments: [userId, String(eventId)],
     });
     return JSON.parse(raw);
+};
+
+// ---------------------------------------------------------------- lottery mode
+
+// Registration window. SADD is already idempotent, so registering twice takes
+// one slot for free — no check-then-insert, therefore no race to make atomic.
+// Returns 1 on first registration, 0 on a repeat, which is what lets the
+// service layer distinguish "you're in" from "you were already in" without a
+// second round trip.
+export const registerForDraw = async (eventId, userId) =>
+    redis.sAdd(registrantsKey(eventId), userId);
+
+export const isRegistered = async (eventId, userId) =>
+    redis.sIsMember(registrantsKey(eventId), userId);
+
+export const countRegistrants = async (eventId) => redis.sCard(registrantsKey(eventId));
+
+export const isDrawDone = async (eventId) => (await redis.exists(drawDoneKey(eventId))) === 1;
+
+// Scores every registrant into the waiting ZSET, once. The `draw-done` flag is
+// set inside the same script that does the scoring, so two concurrent first
+// requests after sale-open cannot both draw — a second draw would re-rank users
+// who have already been shown a position, and a position that moves upward is
+// the one failure this queue is built to exclude.
+//
+// The whole registration set is scored in a single script, which blocks Redis
+// for its duration. That is acceptable here (thousands of registrants, single
+// digit milliseconds) and is the honest scaling limit of this implementation:
+// past roughly 10^5 registrants the draw belongs in the admitter worker,
+// chunked across ticks, with `GET /queue/position` reporting a "drawing" state
+// until it finishes. It is NOT correct to chunk it across separate requests
+// while showing positions — partial ranks move.
+const DRAW_LUA = `
+${DRAW_SCORE_LUA}
+
+local queue        = KEYS[1]
+local registrants  = KEYS[2]
+local drawDone     = KEYS[3]
+local activeQueues = KEYS[4]
+
+local seed    = ARGV[1]
+local eventId = ARGV[2]
+
+if redis.call('EXISTS', drawDone) == 1 then
+  return cjson.encode({ drawn = false, size = redis.call('ZCARD', queue) })
+end
+
+local members = redis.call('SMEMBERS', registrants)
+for i = 1, #members do
+  redis.call('ZADD', queue, drawScore(seed, members[i]), members[i])
+end
+
+redis.call('SET', drawDone, '1')
+if #members > 0 then
+  redis.call('SADD', activeQueues, eventId)
+end
+
+return cjson.encode({ drawn = true, size = #members })
+`;
+
+export const runDraw = async (eventId, seed) => {
+    const raw = await redis.eval(DRAW_LUA, {
+        keys: [
+            queueKey(eventId),
+            registrantsKey(eventId),
+            drawDoneKey(eventId),
+            ACTIVE_QUEUES_KEY,
+        ],
+        arguments: [seed, String(eventId)],
+    });
+    return JSON.parse(raw);
+};
+
+// A latecomer, arriving after the draw has already run — they missed the
+// registration window entirely.
+//
+// They are appended BEHIND every drawn member, not scored by `drawScore`. This
+// is the one place the two fairness properties genuinely conflict, and
+// monotonicity wins:
+//
+//   · Scoring a latecomer by hash would sometimes place them mid-queue, which
+//     shifts the rank of everyone behind that slot UP BY ONE. Those users have
+//     already been shown their position. A position that worsens is the single
+//     failure this queue exists to exclude (`DECISIONS.md` #55), and it would be
+//     caused here by someone else's arrival — the most corrosive version of it.
+//   · Appending cannot move anyone: a member added at the tail changes no
+//     existing rank.
+//
+// The cost is that arrival time DOES determine order among latecomers. That is
+// accepted and is not the property Day 3 is about: the draw exists to make the
+// registration window fair to everyone who entered it, not to reward arriving
+// after it closed. Latecomers are strictly behind registrants, and FIFO among
+// themselves.
+//
+// Scores are offset past 2^52 — one above the widest value `drawScore` can
+// produce (13 hex chars) — so a latecomer can never tie with or undercut a drawn
+// member no matter what the seed hashed to.
+const LATE_JOIN_LUA = `
+local queue        = KEYS[1]
+local seqKey       = KEYS[2]
+local registrants  = KEYS[3]
+local activeQueues = KEYS[4]
+
+local userId  = ARGV[1]
+local eventId = ARGV[2]
+
+local LATE_BASE = 4503599627370496  -- 2^52, above every possible drawScore
+
+if redis.call('ZSCORE', queue, userId) then
+  return redis.call('ZRANK', queue, userId) + 1
+end
+
+local seq = redis.call('INCR', seqKey)
+redis.call('SADD', registrants, userId)
+redis.call('SADD', activeQueues, eventId)
+-- %.0f for the same reason as drawScore: a bare number here would reach ZADD as
+-- "4.5035996273705e+15" and every latecomer would collapse onto one score.
+redis.call('ZADD', queue, string.format('%.0f', LATE_BASE + seq), userId)
+return redis.call('ZRANK', queue, userId) + 1
+`;
+
+export const lateJoinDraw = async (eventId, userId) => {
+    const position = await redis.eval(LATE_JOIN_LUA, {
+        keys: [
+            queueKey(eventId),
+            queueSeqKey(eventId),
+            registrantsKey(eventId),
+            ACTIVE_QUEUES_KEY,
+        ],
+        arguments: [userId, String(eventId)],
+    });
+    return Number(position);
 };
 
 // null means "not currently waiting" — either never joined, or already
