@@ -1,0 +1,860 @@
+<!-- ============================================================================
+     Ticketmaster — System Architecture
+
+     THREE WAYS TO USE THIS FILE
+     1. As its own page — serve or open it directly.
+     2. In an iframe (safest, zero CSS interaction with your site):
+          <iframe src="/architecture/ticketmaster.html"
+                  style="width:100%;height:90vh;border:0"
+                  loading="lazy" title="Ticketmaster — System Architecture"></iframe>
+     3. Inline — copy everything between the INLINE-COPY markers into your page.
+        Every selector is scoped under .sysdoc, so nothing here can style, or be
+        styled by, the rest of your site.
+
+     THEME
+     Follows the visitor's OS by default. Also follows YOUR site automatically if
+     the host page sets data-theme="dark"/"light" or a .dark class on <html>.
+     The corner button overrides both and remembers the choice in localStorage.
+     To hard-pin one theme: set data-sysdoc-theme="dark" (or "light") on the
+     .sysdoc div and delete the button.
+     ============================================================================ -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ticketmaster — System Architecture</title>
+<meta name="description" content="Event ticketing backend: component map, the three-layer double-book guard, Redis hold structures, queue fairness, and the payment saga.">
+</head>
+<body style="margin:0">
+
+<!-- ==================== INLINE-COPY START ==================== -->
+<div class="sysdoc" data-sysdoc-theme="auto">
+<style>
+/* Scoped under .sysdoc. No global element selectors and no body styles, so this
+   block cannot leak into a host page — nor be flattened by the host's reset. */
+.sysdoc {
+  --sd-paper: #fbfbfc;
+  --sd-panel: #f2f3f6;
+  --sd-ink: #14181d;
+  --sd-muted: #5d6673;
+  --sd-rule: #dde2e8;
+  --sd-accent: #a8322b;
+  --sd-accent-soft: #f3e3e1;
+  --sd-good: #1f6f4a;
+  --sd-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --sd-serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+
+  background: var(--sd-paper);
+  color: var(--sd-ink);
+  font-family: var(--sd-serif);
+  font-size: 17px;
+  line-height: 1.65;
+  display: block;
+  padding: 0 24px 96px;
+  position: relative;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* One dark palette, three ways to reach it: an explicit choice on this element,
+   the host site's own dark flag, or the OS. */
+.sysdoc[data-sysdoc-theme="dark"],
+html[data-theme="dark"] .sysdoc[data-sysdoc-theme="auto"],
+html.dark .sysdoc[data-sysdoc-theme="auto"] {
+  --sd-paper: #10131a;
+  --sd-panel: #191d26;
+  --sd-ink: #e6e9ee;
+  --sd-muted: #98a2b0;
+  --sd-rule: #2b313d;
+  --sd-accent: #ef7f72;
+  --sd-accent-soft: #2e1d1b;
+  --sd-good: #6fc79b;
+}
+@media (prefers-color-scheme: dark) {
+  /* The guards keep an explicit light choice — the visitor's, or the host
+     site's — beating a dark OS. */
+  .sysdoc[data-sysdoc-theme="auto"]:not(.sysdoc-force-light) {
+    --sd-paper: #10131a;
+    --sd-panel: #191d26;
+    --sd-ink: #e6e9ee;
+    --sd-muted: #98a2b0;
+    --sd-rule: #2b313d;
+    --sd-accent: #ef7f72;
+    --sd-accent-soft: #2e1d1b;
+    --sd-good: #6fc79b;
+  }
+  html[data-theme="light"] .sysdoc[data-sysdoc-theme="auto"],
+  html.light .sysdoc[data-sysdoc-theme="auto"] {
+    --sd-paper: #fbfbfc;
+    --sd-panel: #f2f3f6;
+    --sd-ink: #14181d;
+    --sd-muted: #5d6673;
+    --sd-rule: #dde2e8;
+    --sd-accent: #a8322b;
+    --sd-accent-soft: #f3e3e1;
+    --sd-good: #1f6f4a;
+  }
+}
+
+.sysdoc .sd-wrap { max-width: 1080px; margin: 0 auto; }
+.sysdoc .prose { max-width: 66ch; }
+
+.sysdoc .sd-toggle {
+  position: sticky;
+  top: 16px;
+  float: right;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 16px 0 0;
+  padding: 7px 12px;
+  font-family: var(--sd-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--sd-muted);
+  background: var(--sd-paper);
+  border: 1px solid var(--sd-rule);
+  border-radius: 2px;
+  cursor: pointer;
+  line-height: 1;
+}
+.sysdoc .sd-toggle:hover { color: var(--sd-ink); border-color: var(--sd-muted); }
+.sysdoc .sd-toggle:focus-visible { outline: 2px solid var(--sd-accent); outline-offset: 2px; }
+.sysdoc .sd-toggle svg { width: 13px; height: 13px; min-width: 0; margin: 0; }
+
+.sysdoc .sd-header {
+  padding: 56px 0 40px;
+  border-bottom: 1px solid var(--sd-rule);
+  margin-bottom: 56px;
+  clear: both;
+}
+.sysdoc .eyebrow {
+  font-family: var(--sd-mono);
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--sd-accent);
+  margin: 0 0 18px;
+}
+.sysdoc h1 {
+  font-family: var(--sd-mono);
+  font-size: clamp(28px, 5vw, 46px);
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  text-wrap: balance;
+  margin: 0 0 20px;
+  color: var(--sd-ink);
+}
+.sysdoc .standfirst { font-size: 20px; color: var(--sd-muted); margin: 0; max-width: 60ch; }
+
+.sysdoc h2 {
+  font-family: var(--sd-mono);
+  font-size: 13px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--sd-muted);
+  margin: 0 0 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--sd-rule);
+}
+.sysdoc h3 {
+  font-family: var(--sd-mono);
+  font-size: 21px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+  margin: 0 0 14px;
+  color: var(--sd-ink);
+}
+.sysdoc section { margin-bottom: 72px; }
+.sysdoc p { margin: 0 0 16px; }
+.sysdoc strong { font-weight: 600; }
+.sysdoc code {
+  font-family: var(--sd-mono);
+  font-size: 0.86em;
+  background: var(--sd-panel);
+  color: var(--sd-ink);
+  padding: 0.12em 0.34em;
+  border-radius: 2px;
+}
+
+.sysdoc figure { margin: 34px 0 30px; padding: 0; }
+.sysdoc .figbox {
+  overflow-x: auto;
+  background: var(--sd-panel);
+  border: 1px solid var(--sd-rule);
+  border-radius: 3px;
+  padding: 22px 20px;
+}
+.sysdoc figure svg { display: block; max-width: 100%; height: auto; min-width: 620px; margin: 0 auto; }
+.sysdoc figcaption {
+  font-family: var(--sd-mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--sd-muted);
+  margin-top: 12px;
+  max-width: 78ch;
+}
+.sysdoc figcaption b { color: var(--sd-ink); font-weight: 600; }
+
+/* Inline SVG resolves from the same tokens as the prose around it. */
+.sysdoc svg text { font-family: var(--sd-mono); fill: var(--sd-ink); }
+.sysdoc svg .box { fill: var(--sd-paper); stroke: var(--sd-ink); stroke-width: 1.25; }
+.sysdoc svg .store { fill: var(--sd-paper); stroke: var(--sd-muted); stroke-width: 1.25; }
+.sysdoc svg .hot { fill: var(--sd-accent-soft); stroke: var(--sd-accent); stroke-width: 1.5; }
+.sysdoc svg .edge { stroke: var(--sd-muted); stroke-width: 1.25; fill: none; }
+.sysdoc svg .edge-accent { stroke: var(--sd-accent); stroke-width: 1.75; fill: none; }
+.sysdoc svg .edge-dash { stroke: var(--sd-muted); stroke-width: 1.25; fill: none; stroke-dasharray: 5 4; }
+.sysdoc svg .lbl { font-size: 12px; }
+.sysdoc svg .lbl-sm { font-size: 10.5px; fill: var(--sd-muted); }
+.sysdoc svg .lbl-accent { font-size: 10.5px; fill: var(--sd-accent); }
+.sysdoc svg .lbl-good { font-size: 10.5px; fill: var(--sd-good); }
+.sysdoc svg .head { font-size: 12.5px; font-weight: 600; }
+.sysdoc svg .arrow-m { fill: var(--sd-muted); }
+.sysdoc svg .arrow-a { fill: var(--sd-accent); }
+
+.sysdoc table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--sd-mono);
+  font-size: 13px;
+  margin: 24px 0;
+  font-variant-numeric: tabular-nums;
+}
+.sysdoc th, .sysdoc td {
+  text-align: left;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--sd-rule);
+  vertical-align: top;
+  color: var(--sd-ink);
+}
+.sysdoc th {
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--sd-muted);
+  font-weight: 600;
+}
+.sysdoc td:first-child { white-space: nowrap; color: var(--sd-accent); }
+
+.sysdoc .callout {
+  border-left: 2px solid var(--sd-accent);
+  padding: 2px 0 2px 18px;
+  margin: 26px 0;
+}
+.sysdoc .callout p:last-child { margin-bottom: 0; }
+
+.sysdoc .sd-footer {
+  border-top: 1px solid var(--sd-rule);
+  padding-top: 20px;
+  font-family: var(--sd-mono);
+  font-size: 12px;
+  color: var(--sd-muted);
+}
+
+@media (max-width: 640px) {
+  .sysdoc { font-size: 16px; padding: 0 16px 72px; }
+  .sysdoc .standfirst { font-size: 18px; }
+  .sysdoc .sd-header { padding-top: 40px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sysdoc * { transition: none !important; animation: none !important; }
+}
+</style>
+
+<div class="sd-wrap">
+
+<button class="sd-toggle" type="button" data-sysdoc-toggle>
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+    <circle cx="12" cy="12" r="4"></circle>
+    <path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"></path>
+  </svg>
+  <span data-sysdoc-label>Theme: auto</span>
+</button>
+
+<div class="sd-header">
+  <p class="eyebrow">System design · event ticketing</p>
+  <h1>Ticketmaster</h1>
+  <p class="standfirst">Four HTTP services and three workers behind one gateway. The whole design turns on a single question: how do you sell ten thousand seats to a million people without ever selling one seat twice?</p>
+</div>
+
+<section>
+  <h2>The shape of the problem</h2>
+  <div class="prose">
+    <p>Ticketing is read-heavy with violently spiky writes. An event sits idle for weeks, then takes 100:1 oversubscription in seconds. Two properties fight each other under that load:</p>
+    <p><strong>Availability wants caching.</strong> A seat map is read thousands of times per sale. <strong>Correctness forbids it.</strong> A cached seat map sells seats that are already gone.</p>
+    <p>The resolution runs through every diagram below: <strong>Redis holds intent, Postgres holds fact.</strong> Losing a hold is survivable — the seat reopens and nobody was charged. Losing a booking is not.</p>
+  </div>
+</section>
+
+<section>
+  <h2>01 · Component map</h2>
+  <h3>Who talks to whom</h3>
+
+  <figure>
+    <div class="figbox">
+      <svg viewBox="0 0 980 620" role="img" aria-label="Component map: client through gateway to auth, event, search and booking services, over Postgres, Redis and Elasticsearch, with outbox-poller, admitter and reconciler workers.">
+        <defs>
+          <marker id="tm-am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow-m"/>
+          </marker>
+          <marker id="tm-aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow-a"/>
+          </marker>
+        </defs>
+
+        <!-- client -->
+        <rect class="box" x="30" y="26" width="128" height="40" rx="3"/>
+        <text class="lbl" x="94" y="51" text-anchor="middle">Client</text>
+
+        <!-- gateway -->
+        <rect class="hot" x="286" y="20" width="408" height="66" rx="3"/>
+        <text class="head" x="490" y="44" text-anchor="middle">API Gateway :3000</text>
+        <text class="lbl-sm" x="490" y="63" text-anchor="middle">authn · authz · rate limit · routing · correlation-id</text>
+        <text class="lbl-sm" x="490" y="78" text-anchor="middle">the only published port</text>
+
+        <line class="edge" x1="158" y1="46" x2="280" y2="46" marker-end="url(#tm-am)"/>
+        <text class="lbl-sm" x="219" y="38" text-anchor="middle">https</text>
+
+        <!-- services -->
+        <rect class="box" x="30" y="150" width="176" height="72" rx="3"/>
+        <text class="head" x="118" y="174" text-anchor="middle">Auth :3001</text>
+        <text class="lbl-sm" x="118" y="192" text-anchor="middle">register · login</text>
+        <text class="lbl-sm" x="118" y="208" text-anchor="middle">JWT + refresh</text>
+
+        <rect class="box" x="234" y="150" width="200" height="72" rx="3"/>
+        <text class="head" x="334" y="174" text-anchor="middle">Event :3002</text>
+        <text class="lbl-sm" x="334" y="192" text-anchor="middle">CRUD · cache · seat map</text>
+        <text class="lbl-sm" x="334" y="208" text-anchor="middle">SSE stream</text>
+
+        <rect class="box" x="462" y="150" width="164" height="72" rx="3"/>
+        <text class="head" x="544" y="174" text-anchor="middle">Search :3003</text>
+        <text class="lbl-sm" x="544" y="192" text-anchor="middle">fuzzy · multi-filter</text>
+
+        <rect class="hot" x="654" y="150" width="296" height="72" rx="3"/>
+        <text class="head" x="802" y="174" text-anchor="middle">Booking :3004</text>
+        <text class="lbl-sm" x="802" y="192" text-anchor="middle">reserve · confirm · cancel · queue</text>
+        <text class="lbl-sm" x="802" y="208" text-anchor="middle">admission gate · Stripe</text>
+
+        <line class="edge" x1="360" y1="86" x2="130" y2="146" marker-end="url(#tm-am)"/>
+        <line class="edge" x1="420" y1="86" x2="340" y2="146" marker-end="url(#tm-am)"/>
+        <line class="edge" x1="560" y1="86" x2="546" y2="146" marker-end="url(#tm-am)"/>
+        <line class="edge-accent" x1="630" y1="86" x2="780" y2="146" marker-end="url(#tm-aa)"/>
+        <text class="lbl-accent" x="726" y="112">X-User-Id injected</text>
+
+        <!-- datastores -->
+        <rect class="store" x="60" y="316" width="212" height="76" rx="3"/>
+        <text class="head" x="166" y="340" text-anchor="middle">PostgreSQL</text>
+        <text class="lbl-sm" x="166" y="358" text-anchor="middle">source of truth</text>
+        <text class="lbl-sm" x="166" y="374" text-anchor="middle">tickets · bookings · payments</text>
+
+        <rect class="store" x="336" y="316" width="212" height="76" rx="3"/>
+        <text class="head" x="442" y="340" text-anchor="middle">Redis</text>
+        <text class="lbl-sm" x="442" y="358" text-anchor="middle">holds · queue · cache</text>
+        <text class="lbl-sm" x="442" y="374" text-anchor="middle">pub/sub · rate limit</text>
+
+        <rect class="store" x="614" y="316" width="212" height="76" rx="3"/>
+        <text class="head" x="720" y="340" text-anchor="middle">Elasticsearch</text>
+        <text class="lbl-sm" x="720" y="358" text-anchor="middle">event search index</text>
+
+        <line class="edge" x1="118" y1="222" x2="150" y2="312" marker-end="url(#tm-am)"/>
+        <line class="edge" x1="310" y1="222" x2="200" y2="312" marker-end="url(#tm-am)"/>
+        <line class="edge" x1="360" y1="222" x2="410" y2="312" marker-end="url(#tm-am)"/>
+        <text class="lbl-sm" x="352" y="272">reads holds</text>
+        <line class="edge" x1="560" y1="222" x2="694" y2="312" marker-end="url(#tm-am)"/>
+        <line class="edge-accent" x1="760" y1="222" x2="262" y2="314" marker-end="url(#tm-aa)"/>
+        <text class="lbl-accent" x="470" y="250">confirms · the arbiter</text>
+        <line class="edge-accent" x1="740" y1="222" x2="530" y2="314" marker-end="url(#tm-aa)"/>
+        <text class="lbl-accent" x="600" y="290">writes holds</text>
+
+        <!-- stripe -->
+        <rect class="store" x="854" y="248" width="96" height="42" rx="3"/>
+        <text class="lbl" x="902" y="274" text-anchor="middle">Stripe</text>
+        <line class="edge-accent" x1="900" y1="222" x2="900" y2="244" marker-end="url(#tm-aa)"/>
+
+        <!-- sse return path -->
+        <path class="edge-dash" d="M 442 392 C 442 440 300 440 300 240 L 300 226" marker-end="url(#tm-am)"/>
+        <text class="lbl-sm" x="318" y="436">pub/sub → SSE fan-out</text>
+
+        <!-- workers -->
+        <text class="lbl-sm" x="30" y="492" style="letter-spacing:0.1em">WORKERS — no inbound port</text>
+        <line class="edge" x1="30" y1="500" x2="950" y2="500"/>
+
+        <rect class="box" x="30" y="522" width="272" height="66" rx="3"/>
+        <text class="head" x="166" y="546" text-anchor="middle">outbox-poller</text>
+        <text class="lbl-sm" x="166" y="564" text-anchor="middle">Postgres outbox → Elasticsearch</text>
+        <text class="lbl-sm" x="166" y="579" text-anchor="middle">FOR UPDATE SKIP LOCKED</text>
+
+        <rect class="box" x="330" y="522" width="272" height="66" rx="3"/>
+        <text class="head" x="466" y="546" text-anchor="middle">admitter</text>
+        <text class="lbl-sm" x="466" y="564" text-anchor="middle">drains queue into booking flow</text>
+        <text class="lbl-sm" x="466" y="579" text-anchor="middle">single leader, fenced lease</text>
+
+        <rect class="box" x="630" y="522" width="320" height="66" rx="3"/>
+        <text class="head" x="790" y="546" text-anchor="middle">reconciler</text>
+        <text class="lbl-sm" x="790" y="564" text-anchor="middle">stranded payments · Redis↔PG drift</text>
+        <text class="lbl-sm" x="790" y="579" text-anchor="middle">no lease — SKIP LOCKED is enough</text>
+
+        <line class="edge" x1="166" y1="518" x2="166" y2="396" marker-end="url(#tm-am)"/>
+        <line class="edge" x1="230" y1="522" x2="700" y2="396" marker-end="url(#tm-am)"/>
+        <line class="edge" x1="466" y1="518" x2="450" y2="396" marker-end="url(#tm-am)"/>
+        <line class="edge" x1="700" y1="518" x2="240" y2="396" marker-end="url(#tm-am)"/>
+      </svg>
+    </div>
+    <figcaption><b>Red marks the money path.</b> Only the gateway publishes a port; the rest are reachable on the internal network alone, which is what makes downstream services' trust of the injected <code>X-User-Id</code> header safe. Note the asymmetry at Redis: Booking Service <b>writes</b> hold keys, Event Service only <b>reads</b> them — one writer, many readers, one shared module defining the key names.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>02 · The core invariant</h2>
+  <h3>Three independent guards against selling one seat twice</h3>
+
+  <div class="prose">
+    <p>A single guard is a single point of failure, so the confirm path stacks three mechanisms that fail independently. Each one alone is sufficient; each covers a different way the others could be broken by a later change.</p>
+  </div>
+
+  <figure>
+    <div class="figbox">
+      <svg viewBox="0 0 940 400" role="img" aria-label="Three layered guards against double-booking: Redis hold, conditional UPDATE with rowcount check, and a UNIQUE constraint on booking_items.">
+        <defs>
+          <marker id="tm2-am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow-m"/>
+          </marker>
+        </defs>
+
+        <text class="lbl-sm" x="40" y="26">TWO BUYERS, ONE SEAT, SAME INSTANT</text>
+
+        <rect class="box" x="40" y="42" width="112" height="36" rx="3"/>
+        <text class="lbl" x="96" y="65" text-anchor="middle">buyer A</text>
+        <rect class="box" x="40" y="90" width="112" height="36" rx="3"/>
+        <text class="lbl" x="96" y="113" text-anchor="middle">buyer B</text>
+
+        <!-- layer 1 -->
+        <rect class="hot" x="216" y="42" width="196" height="84" rx="3"/>
+        <text class="head" x="314" y="66" text-anchor="middle">1 · Redis hold</text>
+        <text class="lbl-sm" x="314" y="84" text-anchor="middle">SET NX inside one Lua</text>
+        <text class="lbl-sm" x="314" y="99" text-anchor="middle">script — atomic claim</text>
+        <text class="lbl-accent" x="314" y="118" text-anchor="middle">optimization, not truth</text>
+
+        <line class="edge" x1="152" y1="60" x2="210" y2="66" marker-end="url(#tm2-am)"/>
+        <line class="edge" x1="152" y1="108" x2="210" y2="102" marker-end="url(#tm2-am)"/>
+
+        <!-- layer 2 -->
+        <rect class="box" x="470" y="42" width="212" height="84" rx="3"/>
+        <text class="head" x="576" y="66" text-anchor="middle">2 · conditional UPDATE</text>
+        <text class="lbl-sm" x="576" y="84" text-anchor="middle">WHERE status='available'</text>
+        <text class="lbl-sm" x="576" y="99" text-anchor="middle">+ rowcount check</text>
+        <text class="lbl-accent" x="576" y="118" text-anchor="middle">the primary guard</text>
+
+        <line class="edge" x1="412" y1="84" x2="464" y2="84" marker-end="url(#tm2-am)"/>
+
+        <!-- layer 3 -->
+        <rect class="box" x="740" y="42" width="164" height="84" rx="3"/>
+        <text class="head" x="822" y="66" text-anchor="middle">3 · UNIQUE</text>
+        <text class="lbl-sm" x="822" y="84" text-anchor="middle">booking_items</text>
+        <text class="lbl-sm" x="822" y="99" text-anchor="middle">(ticket_id)</text>
+        <text class="lbl-accent" x="822" y="118" text-anchor="middle">database backstop</text>
+
+        <line class="edge" x1="682" y1="84" x2="734" y2="84" marker-end="url(#tm2-am)"/>
+
+        <!-- outcomes -->
+        <line class="edge" x1="40" y1="168" x2="904" y2="168"/>
+        <text class="lbl-sm" x="40" y="190">WHAT EACH LAYER STOPS, AND WHAT HAPPENS IF IT IS REMOVED</text>
+
+        <rect class="store" x="216" y="208" width="196" height="88" rx="3"/>
+        <text class="lbl-sm" x="314" y="230" text-anchor="middle">stops: 99 people filling</text>
+        <text class="lbl-sm" x="314" y="245" text-anchor="middle">in card details for a seat</text>
+        <text class="lbl-sm" x="314" y="260" text-anchor="middle">the 100th is buying</text>
+        <text class="lbl-good" x="314" y="283" text-anchor="middle">remove it → still correct</text>
+
+        <rect class="store" x="470" y="208" width="212" height="88" rx="3"/>
+        <text class="lbl-sm" x="576" y="230" text-anchor="middle">stops: the actual</text>
+        <text class="lbl-sm" x="576" y="245" text-anchor="middle">double-sell. Loser matches</text>
+        <text class="lbl-sm" x="576" y="260" text-anchor="middle">zero rows → 409</text>
+        <text class="lbl-good" x="576" y="283" text-anchor="middle">remove it → layer 3 holds</text>
+
+        <rect class="store" x="740" y="208" width="164" height="88" rx="3"/>
+        <text class="lbl-sm" x="822" y="230" text-anchor="middle">stops: everything</text>
+        <text class="lbl-sm" x="822" y="245" text-anchor="middle">above being wrong.</text>
+        <text class="lbl-sm" x="822" y="260" text-anchor="middle">Physically refuses.</text>
+        <text class="lbl-good" x="822" y="283" text-anchor="middle">last line — never remove</text>
+
+        <line class="edge-dash" x1="314" y1="130" x2="314" y2="204"/>
+        <line class="edge-dash" x1="576" y1="130" x2="576" y2="204"/>
+        <line class="edge-dash" x1="822" y1="130" x2="822" y2="204"/>
+
+        <rect class="hot" x="40" y="330" width="864" height="46" rx="3"/>
+        <text class="lbl" x="472" y="352" text-anchor="middle">Verified: layer 2 disabled by a runtime flag, 50 concurrent buyers → 1 × 201, 49 × 409.</text>
+        <text class="lbl-sm" x="472" y="368" text-anchor="middle">The constraint alone held. A claim of defence-in-depth is worth nothing until each layer is tested alone.</text>
+      </svg>
+    </div>
+    <figcaption><b>Layer 1 protects effort; layers 2 and 3 protect correctness.</b> This is why <code>tickets.status</code> has only <code>available</code> and <code>booked</code> and no <code>held</code> — a hold is a self-expiring lease, and putting it in Postgres would make a sweeper a correctness dependency. Flush Redis mid-sale and every hold vanishes, yet nothing is sold twice.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>03 · Hold state</h2>
+  <h3>Three Redis structures, because the claim and the read want opposite things</h3>
+
+  <div class="prose">
+    <p>The obvious design is one key per seat with a TTL. It makes the claim trivial and the seat map impossible: rendering a 50,000-seat event would be 50,000 round trips.</p>
+  </div>
+
+  <figure>
+    <div class="figbox">
+      <svg viewBox="0 0 940 430" role="img" aria-label="Comparison: one key per seat requires N round trips to read a seat map, while a sorted set plus hash reads the whole event in two.">
+        <defs>
+          <marker id="tm3-am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow-m"/>
+          </marker>
+          <marker id="tm3-aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow-a"/>
+          </marker>
+        </defs>
+
+        <!-- rejected -->
+        <text class="lbl-sm" x="30" y="26">REJECTED — ONE KEY PER SEAT</text>
+        <rect class="store" x="30" y="40" width="392" height="150" rx="3"/>
+        <text class="lbl-sm" x="50" y="66">hold:evt1:seat:A12 → user 7   EX 600</text>
+        <text class="lbl-sm" x="50" y="86">hold:evt1:seat:A13 → user 9   EX 600</text>
+        <text class="lbl-sm" x="50" y="106">hold:evt1:seat:A14 → user 4   EX 600</text>
+        <text class="lbl-sm" x="50" y="126">…  × 50,000</text>
+        <text class="lbl" x="50" y="158">read seat map = 50,000 × GET</text>
+        <text class="lbl-sm" x="50" y="176">expiry fires no event a reader can observe</text>
+
+        <!-- chosen -->
+        <text class="lbl-accent" x="518" y="26">CHOSEN — SORTED SET + HASH + PER-USER INDEX</text>
+
+        <rect class="hot" x="518" y="40" width="392" height="46" rx="3"/>
+        <text class="lbl" x="534" y="60">…:seats</text>
+        <text class="lbl-sm" x="614" y="60">ZSET  member=ticketId  score=expiresAtMs</text>
+        <text class="lbl-sm" x="534" y="78">the bulk read — one ZRANGEBYSCORE for the whole event</text>
+
+        <rect class="box" x="518" y="96" width="392" height="46" rx="3"/>
+        <text class="lbl" x="534" y="116">…:owner</text>
+        <text class="lbl-sm" x="614" y="116">HASH  field=ticketId  value=userId</text>
+        <text class="lbl-sm" x="534" y="134">who holds it — separates “someone else” from “you already do”</text>
+
+        <rect class="box" x="518" y="152" width="392" height="46" rx="3"/>
+        <text class="lbl" x="534" y="172">…:u:&lt;userId&gt;</text>
+        <text class="lbl-sm" x="628" y="172">ZSET  the per-user index</text>
+        <text class="lbl-sm" x="534" y="190">makes the per-user cap a ZCARD inside the same atomic script</text>
+
+        <text class="lbl-sm" x="518" y="222">all three share the hash tag  hold:{evt:&lt;id&gt;}:…  so one Lua script can touch them</text>
+
+        <!-- read path -->
+        <line class="edge" x1="30" y1="256" x2="910" y2="256"/>
+        <text class="lbl-sm" x="30" y="278">SEAT-MAP READ — CONSTANT COST AT ANY EVENT SIZE</text>
+
+        <rect class="box" x="30" y="300" width="150" height="44" rx="3"/>
+        <text class="lbl" x="105" y="327" text-anchor="middle">Event Service</text>
+
+        <rect class="store" x="252" y="292" width="188" height="60" rx="3"/>
+        <text class="lbl" x="346" y="315" text-anchor="middle">Postgres</text>
+        <text class="lbl-sm" x="346" y="333" text-anchor="middle">booked / available</text>
+
+        <rect class="hot" x="512" y="292" width="188" height="60" rx="3"/>
+        <text class="lbl" x="606" y="315" text-anchor="middle">Redis</text>
+        <text class="lbl-sm" x="606" y="333" text-anchor="middle">live holds by score</text>
+
+        <rect class="box" x="770" y="292" width="140" height="60" rx="3"/>
+        <text class="lbl" x="840" y="315" text-anchor="middle">effective</text>
+        <text class="lbl-sm" x="840" y="333" text-anchor="middle">status per seat</text>
+
+        <line class="edge" x1="180" y1="322" x2="246" y2="322" marker-end="url(#tm3-am)"/>
+        <text class="lbl-sm" x="196" y="314">1 query</text>
+        <line class="edge-accent" x1="440" y1="322" x2="506" y2="322" marker-end="url(#tm3-aa)"/>
+        <text class="lbl-accent" x="452" y="314">2 calls</text>
+        <line class="edge" x1="700" y1="322" x2="764" y2="322" marker-end="url(#tm3-am)"/>
+
+        <text class="lbl-sm" x="30" y="382">booked outranks held · an expired score is never observable as live, whether or not anything purged it</text>
+        <text class="lbl-sm" x="30" y="402">no sweeper is a correctness dependency — the purge only reclaims memory</text>
+      </svg>
+    </div>
+    <figcaption><b>Expiry is carried by the score, not a per-key TTL.</b> That is what makes the real-time seat map possible without keyspace notifications: a reader filtering by score can never observe an expired hold as live, so there is no gap to miss. Cost of the choice — the claim now spans three keys, so it needs a Lua script rather than one atomic command.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>04 · Fairness under 100:1</h2>
+  <h3>Queue, admission, and why FIFO is the wrong answer</h3>
+
+  <div class="prose">
+    <p>A million users, ten thousand seats. Nine hundred and ninety thousand people leave disappointed no matter what the code does, so "fairness" is a policy choice, not a property you can implement your way into.</p>
+    <p><strong>Pure FIFO rewards fibre and proximity.</strong> It selects for the fastest network and for bots that pre-warm connections, while looking fair. So the queue registers everyone first, then draws an order from a seed that does not exist until the sale opens.</p>
+  </div>
+
+  <figure>
+    <div class="figbox">
+      <svg viewBox="0 0 940 470" role="img" aria-label="Queue lifecycle: registration window, randomized draw at sale open, admitter granting signed admission tokens, then the booking flow.">
+        <defs>
+          <marker id="tm4-am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow-m"/>
+          </marker>
+          <marker id="tm4-aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow-a"/>
+          </marker>
+        </defs>
+
+        <!-- phase 1 -->
+        <rect class="box" x="30" y="46" width="196" height="92" rx="3"/>
+        <text class="head" x="128" y="70" text-anchor="middle">registered</text>
+        <text class="lbl-sm" x="128" y="90" text-anchor="middle">Redis SET, no order</text>
+        <text class="lbl-sm" x="128" y="106" text-anchor="middle">no position exists</text>
+        <text class="lbl-sm" x="128" y="126" text-anchor="middle">and none is shown</text>
+
+        <!-- draw -->
+        <rect class="hot" x="286" y="46" width="212" height="92" rx="3"/>
+        <text class="head" x="392" y="70" text-anchor="middle">the draw</text>
+        <text class="lbl-sm" x="392" y="90" text-anchor="middle">score = hash(seed, userId)</text>
+        <text class="lbl-sm" x="392" y="106" text-anchor="middle">one atomic Lua script</text>
+        <text class="lbl-accent" x="392" y="126" text-anchor="middle">seed born at sale-open</text>
+
+        <line class="edge" x1="226" y1="92" x2="280" y2="92" marker-end="url(#tm4-am)"/>
+
+        <!-- waiting -->
+        <rect class="box" x="558" y="46" width="180" height="92" rx="3"/>
+        <text class="head" x="648" y="70" text-anchor="middle">waiting</text>
+        <text class="lbl-sm" x="648" y="90" text-anchor="middle">Redis ZSET</text>
+        <text class="lbl-sm" x="648" y="106" text-anchor="middle">position = ZRANK + 1</text>
+        <text class="lbl-good" x="648" y="126" text-anchor="middle">never increases</text>
+
+        <line class="edge" x1="498" y1="92" x2="552" y2="92" marker-end="url(#tm4-am)"/>
+
+        <!-- admitted -->
+        <rect class="hot" x="558" y="188" width="180" height="86" rx="3"/>
+        <text class="head" x="648" y="212" text-anchor="middle">admitted</text>
+        <text class="lbl-sm" x="648" y="232" text-anchor="middle">signed JWT issued</text>
+        <text class="lbl-sm" x="648" y="248" text-anchor="middle">self-verifying —</text>
+        <text class="lbl-accent" x="648" y="266" text-anchor="middle">zero store reads to reject</text>
+
+        <line class="edge" x1="648" y1="138" x2="648" y2="184" marker-end="url(#tm4-am)"/>
+
+        <!-- sold out -->
+        <rect class="box" x="798" y="188" width="122" height="86" rx="3"/>
+        <text class="head" x="859" y="212" text-anchor="middle">sold_out</text>
+        <text class="lbl-sm" x="859" y="234" text-anchor="middle">queue drained,</text>
+        <text class="lbl-sm" x="859" y="250" text-anchor="middle">told plainly —</text>
+        <text class="lbl-sm" x="859" y="266" text-anchor="middle">no 40-min wait</text>
+
+        <line class="edge" x1="738" y1="120" x2="859" y2="184" marker-end="url(#tm4-am)"/>
+
+        <!-- admitter -->
+        <rect class="box" x="286" y="188" width="212" height="86" rx="3"/>
+        <text class="head" x="392" y="212" text-anchor="middle">admitter (worker)</text>
+        <text class="lbl-sm" x="392" y="232" text-anchor="middle">budget = floor(remaining</text>
+        <text class="lbl-sm" x="392" y="248" text-anchor="middle">× 1.1) − active</text>
+        <text class="lbl-sm" x="392" y="266" text-anchor="middle">single fenced leader</text>
+
+        <line class="edge-accent" x1="498" y1="231" x2="552" y2="231" marker-end="url(#tm4-aa)"/>
+
+        <!-- booking -->
+        <rect class="hot" x="558" y="330" width="362" height="72" rx="3"/>
+        <text class="head" x="739" y="354" text-anchor="middle">booking flow — reserve → confirm</text>
+        <text class="lbl-sm" x="739" y="374" text-anchor="middle">no admission token → 403 before any Redis or Postgres call</text>
+        <text class="lbl-sm" x="739" y="390" text-anchor="middle">bounded by inventory, not by a rate this code invented</text>
+
+        <line class="edge-accent" x1="648" y1="274" x2="648" y2="326" marker-end="url(#tm4-aa)"/>
+
+        <!-- feedback -->
+        <path class="edge-dash" d="M 558 366 C 240 366 240 300 286 254" marker-end="url(#tm4-am)"/>
+        <text class="lbl-sm" x="150" y="330">expired hold or release</text>
+        <text class="lbl-sm" x="150" y="346">frees a slot next tick</text>
+
+        <!-- policy note -->
+        <line class="edge" x1="30" y1="428" x2="498" y2="428"/>
+        <text class="lbl-sm" x="30" y="450">rate limiting ≠ admission control: one is per-user abuse defence, the other is</text>
+        <text class="lbl-sm" x="30" y="464">global and inventory-aware. Merging them is the classic mistake.</text>
+      </svg>
+    </div>
+    <figcaption><b>Measured, not asserted:</b> across 1,000 sequential registrants, correlation between arrival order and drawn position was r = 0.024 against a 4-sigma bound of 0.127, with a 4×4 quartile chi-square of 5.4 against 27.9. The same measurement on FIFO mode returns exactly 1.0 — which is how you know the measurement works. Latecomers are appended <em>behind</em> everyone, never hash-scored, because inserting mid-queue would push already-shown positions backwards.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>05 · Money</h2>
+  <h3>Three transactions, and why one would be wrong</h3>
+
+  <div class="prose">
+    <p>The tempting shape is a single transaction wrapping the booking and the charge. It is wrong in a way that only appears on a crash — and it fails in the worst possible direction.</p>
+  </div>
+
+  <figure>
+    <div class="figbox">
+      <svg viewBox="0 0 940 480" role="img" aria-label="Payment saga: intent committed before the charge, charge outside any transaction, settlement after; contrasted with a single transaction that loses the payment record on crash.">
+        <defs>
+          <marker id="tm5-am" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow-m"/>
+          </marker>
+          <marker id="tm5-aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow-a"/>
+          </marker>
+        </defs>
+
+        <!-- wrong -->
+        <text class="lbl-sm" x="30" y="24">WRONG — ONE TRANSACTION</text>
+        <rect class="store" x="30" y="38" width="880" height="86" rx="3"/>
+        <text class="lbl-sm" x="52" y="62">BEGIN → book seats → insert payment → charge Stripe → COMMIT</text>
+        <line class="edge-accent" x1="612" y1="72" x2="612" y2="96"/>
+        <text class="lbl-accent" x="622" y="92">crash here</text>
+        <text class="lbl" x="52" y="90">rollback takes the payments row with it</text>
+        <text class="lbl-accent" x="52" y="110">money moved, nothing in the database points at it. Nothing to sweep, nothing to reconcile.</text>
+
+        <!-- right -->
+        <text class="lbl-accent" x="30" y="164">CORRECT — THREE TRANSACTIONS, ORDERED</text>
+
+        <rect class="box" x="30" y="180" width="252" height="96" rx="3"/>
+        <text class="head" x="156" y="204" text-anchor="middle">1 · record intent</text>
+        <text class="lbl-sm" x="156" y="224" text-anchor="middle">book seats · booking 'pending'</text>
+        <text class="lbl-sm" x="156" y="240" text-anchor="middle">payments row 'pending'</text>
+        <text class="lbl-accent" x="156" y="262" text-anchor="middle">COMMITTED before any charge</text>
+
+        <rect class="hot" x="330" y="180" width="252" height="96" rx="3"/>
+        <text class="head" x="456" y="204" text-anchor="middle">2 · charge</text>
+        <text class="lbl-sm" x="456" y="224" text-anchor="middle">no transaction, no row locks</text>
+        <text class="lbl-sm" x="456" y="240" text-anchor="middle">idempotency key = booking:&lt;id&gt;</text>
+        <text class="lbl-accent" x="456" y="262" text-anchor="middle">amount summed server-side</text>
+
+        <rect class="box" x="630" y="180" width="280" height="96" rx="3"/>
+        <text class="head" x="770" y="204" text-anchor="middle">3 · settle</text>
+        <text class="lbl-sm" x="770" y="224" text-anchor="middle">payment 'succeeded'</text>
+        <text class="lbl-sm" x="770" y="240" text-anchor="middle">booking → 'confirmed'</text>
+        <text class="lbl-sm" x="770" y="262" text-anchor="middle">guarded on source state</text>
+
+        <line class="edge-accent" x1="282" y1="228" x2="324" y2="228" marker-end="url(#tm5-aa)"/>
+        <line class="edge-accent" x1="582" y1="228" x2="624" y2="228" marker-end="url(#tm5-aa)"/>
+
+        <!-- crash + recovery -->
+        <line class="edge-accent" x1="606" y1="150" x2="606" y2="176"/>
+        <text class="lbl-accent" x="616" y="166">crash here instead</text>
+
+        <text class="lbl-sm" x="30" y="316">WHAT THE CRASH LEAVES, AND WHO CLEANS IT UP</text>
+
+        <rect class="store" x="30" y="332" width="252" height="76" rx="3"/>
+        <text class="lbl-sm" x="46" y="354">booking  = pending</text>
+        <text class="lbl-sm" x="46" y="372">payment  = pending</text>
+        <text class="lbl-sm" x="46" y="390">provider_ref = NULL</text>
+
+        <rect class="box" x="330" y="332" width="252" height="76" rx="3"/>
+        <text class="head" x="456" y="356" text-anchor="middle">reconciler</text>
+        <text class="lbl-sm" x="456" y="376" text-anchor="middle">asks the provider by the</text>
+        <text class="lbl-sm" x="456" y="392" text-anchor="middle">metadata on the charge</text>
+
+        <rect class="box" x="630" y="332" width="280" height="76" rx="3"/>
+        <text class="lbl-good" x="646" y="354">charged → promote to confirmed</text>
+        <text class="lbl-sm" x="646" y="372">seats stay sold, customer keeps them</text>
+        <text class="lbl-sm" x="646" y="390">not charged → release seats, cancel</text>
+
+        <line class="edge" x1="282" y1="370" x2="324" y2="370" marker-end="url(#tm5-am)"/>
+        <line class="edge" x1="582" y1="370" x2="624" y2="370" marker-end="url(#tm5-am)"/>
+        <line class="edge-dash" x1="156" y1="276" x2="156" y2="328" marker-end="url(#tm5-am)"/>
+
+        <rect class="hot" x="30" y="434" width="880" height="34" rx="3"/>
+        <text class="lbl" x="470" y="456" text-anchor="middle">Invariant: no booking is ever left non-terminal. Verified by killing the process between charge and confirm.</text>
+      </svg>
+    </div>
+    <figcaption><b>The refund path runs the opposite way — inside the transaction — and that is correct for the opposite reason.</b> A charge's risk is money moving with no record, so the record commits first. A refund's risk is a record with no money moving, so it belongs where a provider failure can still roll the record back.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>06 · Failure behaviour</h2>
+  <h3>Eight deliberate injections</h3>
+
+  <div class="prose">
+    <p>Each row was predicted in writing, then broken on purpose. The interesting column is the last one.</p>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>Injection</th><th>Result</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Crash between charge and confirm</td><td>Payment left <code>pending</code>; reconciler finds the charge at the provider, promotes the booking. Seats are not resold — the customer paid for them.</td></tr>
+      <tr><td>Hold expires mid-payment</td><td>Confirm still succeeds. The hold was never the authority.</td></tr>
+      <tr><td><code>FLUSHALL</code> Redis mid-booking</td><td>Every hold gone; zero double-books. Layers 2 and 3 are untouched.</td></tr>
+      <tr><td>Redis down entirely</td><td>Reserve fails fast with a clean 5xx; <strong>confirm keeps working</strong>. Recovers unaided.</td></tr>
+      <tr><td>Elasticsearch down</td><td>Bookings unaffected; the outbox accumulates and drains on recovery.</td></tr>
+      <tr><td>Two service instances, one seat</td><td>Exactly one 201, one 409, one charge.</td></tr>
+      <tr><td>Postgres connections killed</td><td>Pool recovers without a restart; no half-written booking.</td></tr>
+      <tr><td>SIGTERM during confirm</td><td>Request completes during drain, or rolls back fully. Never half-written.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <p>The Redis-down case was a genuine bug before the drill found it. node-redis <strong>queues commands while disconnected by default</strong>, so every reserve hung indefinitely rather than failing — turning a cache outage into a total outage. <code>disableOfflineQueue</code> fixes it. Fail fast, not queue quietly.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Scope honesty</h2>
+  <div class="prose">
+    <p>Single-node Postgres, Redis, and Elasticsearch — no replication, no failover. Multi-instance tests run several local processes, not machines or network partitions.</p>
+    <p>All services share one database, and both Event and Booking read <code>tickets</code>. That is a split-by-process, not real service isolation: the data coupling remains and network hops were added. Real boundaries mean a database per service, which turns the booking↔ticket write into a distributed transaction. A deliberate trade, and the honest answer to "who owns the tickets table?" is "shared."</p>
+    <p>CDC is a transactional-outbox poller, not log-based replication. Debezium plus Kafka is the production answer — describable here, not demonstrated.</p>
+    <p>Per-user caps and payment-instrument uniqueness are in scope. Nothing here stops an attacker holding ten thousand verified identities; that is identity verification, and it is the part the real Ticketmaster still loses.</p>
+  </div>
+</section>
+
+<div class="sd-footer">
+  Node · Express · PostgreSQL · Redis · Elasticsearch · Stripe · Docker Compose &nbsp;·&nbsp; 4 HTTP services, 3 workers &nbsp;·&nbsp; 7 acceptance suites, 144 assertions
+</div>
+
+</div>
+
+<script>
+/* No dependencies, no build step. Guarded so two of these documents on one page
+   each register exactly one handler. */
+(function () {
+  var KEY = 'sysdoc-theme';
+
+  function apply(root, mode) {
+    root.setAttribute('data-sysdoc-theme', mode === 'dark' ? 'dark' : 'auto');
+    root.classList.toggle('sysdoc-force-light', mode === 'light');
+    var label = root.querySelector('[data-sysdoc-label]');
+    if (label) label.textContent = 'Theme: ' + mode;
+    var btn = root.querySelector('[data-sysdoc-toggle]');
+    if (btn) btn.setAttribute('aria-label', 'Colour theme, currently ' + mode + '. Activate to change.');
+  }
+
+  function current(root) {
+    if (root.classList.contains('sysdoc-force-light')) return 'light';
+    return root.getAttribute('data-sysdoc-theme') === 'dark' ? 'dark' : 'auto';
+  }
+
+  function init(root) {
+    if (root.dataset.sysdocReady) return;
+    root.dataset.sysdocReady = '1';
+
+    var stored = null;
+    try { stored = localStorage.getItem(KEY); } catch (e) { /* private browsing */ }
+    apply(root, stored || 'auto');
+
+    var btn = root.querySelector('[data-sysdoc-toggle]');
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+      var order = ['auto', 'light', 'dark'];
+      var next = order[(order.indexOf(current(root)) + 1) % order.length];
+      apply(root, next);
+      try { localStorage.setItem(KEY, next); } catch (e) { /* ignore */ }
+    });
+  }
+
+  function boot() {
+    var nodes = document.querySelectorAll('.sysdoc');
+    for (var i = 0; i < nodes.length; i++) init(nodes[i]);
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})();
+</script>
+</div>
+<!-- ===================== INLINE-COPY END ===================== -->
+
+</body>
+</html>

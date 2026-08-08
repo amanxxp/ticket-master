@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { createUpstreamProxy, streamPathFilter, prefixFilter } from "./proxy.js";
+import { createUpstreamProxy, streamPathFilter, waitlistPathFilter, prefixFilter } from "./proxy.js";
 import { authenticate } from "../middlewares/authenticate.js";
 import { enforceAccess } from "../middlewares/enforceAccess.js";
 
@@ -31,6 +31,14 @@ router.use(createUpstreamProxy({
     pathFilter: streamPathFilter,
     proxyTimeoutMs: 0,
 }));
+
+// Same reasoning, same fix, one path over: `/events/:id/waitlist` is a Booking
+// Service route (policy.js already names it `auth: "required"` under that
+// exact path), but it lives one path segment inside the `/events` prefix
+// Event Service claims below. Registered here — before that general proxy —
+// so it is actually reachable rather than 404ing at Event Service, which has
+// no such route and never will.
+router.use(createUpstreamProxy({ name: "booking", target: BOOKING_URL, pathFilter: waitlistPathFilter }));
 
 router.use(createUpstreamProxy({ name: "auth", target: AUTH_URL, pathFilter: prefixFilter("/auth") }));
 router.use(createUpstreamProxy({ name: "event", target: EVENT_URL, pathFilter: prefixFilter("/events") }));

@@ -47,12 +47,13 @@ Read-heavy with violently spiky writes: a popular event goes from idle to 100:1 
 | [TIMELINE.md](TIMELINE.md) | 6-week dated schedule, time boxes, retest ledger |
 | [DECISIONS.md](DECISIONS.md) | Every non-obvious choice and why — 60+ numbered entries. **Grep it, don't read it** |
 | [CLAUDE.md](CLAUDE.md) | Orientation for AI agents: conventions, layering, where the shape deviates |
+| [docs/architecture.html](docs/architecture.html) | Illustrated system design — 5 hand-drawn diagrams, self-contained, light/dark. Embeddable anywhere |
 
-Those four are the whole documentation set. There is no `docs/` directory —
-architecture, data model, hold semantics, and the waiting-room design are all
-argued in `DECISIONS.md` next to the decision that produced them, which is
-where they stay current. A separate `docs/` tree would be a second place to
-forget to update.
+Those five are the whole documentation set. `docs/` holds only the illustrated
+architecture page; the data model, hold semantics, and waiting-room design are
+argued in `DECISIONS.md` next to the decision that produced them, which is where
+they stay current. A wider `docs/` tree would be a second place to forget to
+update.
 
 ## Stack
 
@@ -157,6 +158,8 @@ ticket-master-server/
 ├── docker-compose.yml       # datastores by default; --profile full adds services
 ├── .dockerignore
 ├── package.json             # root tooling only (seed/reset/hammer). NOT a workspace root
+├── docs/
+│   └── architecture.html    # illustrated system design — self-contained, embeddable
 ├── db/
 │   └── schema.sql           # entire schema, one file, no migration tool
 ├── scripts/                 # run via npm from the repo root

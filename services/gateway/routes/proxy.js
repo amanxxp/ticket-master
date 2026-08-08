@@ -78,4 +78,10 @@ export const createUpstreamProxy = ({ name, target, pathFilter, proxyTimeoutMs =
     });
 
 export const streamPathFilter = (pathname) => /^\/events\/[^/]+\/stream$/.test(pathname);
+// `/events/:eventId/waitlist` belongs to Booking Service (policy.js names it
+// explicitly), not Event Service — same "narrower path must be claimed before
+// the general /events prefix" shape as the stream route above, and for the
+// same reason: registered after the general proxy, this path would match
+// `/events` first and never reach Booking Service at all.
+export const waitlistPathFilter = (pathname) => /^\/events\/[^/]+\/waitlist$/.test(pathname);
 export { prefixFilter };
